@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Simplified Chinese rule index.** The existing `DOL021` and `DOL022`
+  translations now have a dedicated partial-locale index linked from the
+  Chinese README. Refs #81.
+
+- **Italian translations for the model-definition rules.** The documentation
+  for `DOL011` through `DOL015` is now available in Italian, with a dedicated
+  index linked from the complete rule reference. Refs #52.
+
+- **Italian translations for the queryset rules.** The documentation for
+  `DOL001` through `DOL008` is now available in Italian and linked from the
+  locale index. Refs #98.
+
 ### Fixed
 
 - **DOL007 no longer fires on attribute accesses that cost nothing.**
