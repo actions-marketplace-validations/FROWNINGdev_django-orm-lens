@@ -9,7 +9,7 @@
 
 # Django ORM Lens
 
-### La capa de inteligencia de esquema para Django.
+### Diagramas ER, detección de N+1 y análisis de riesgo de migraciones para Django, sin arrancarlo.
 
 Todo tu grafo de modelos — en vivo en la barra lateral de tu editor, actuando de gate en tu CI y respondiendo a tu agente de IA vía MCP. Todo a partir de análisis estático: sin base de datos, sin `runserver`, sin venv funcional.
 
@@ -45,10 +45,12 @@ Todo tu grafo de modelos — en vivo en la barra lateral de tu editor, actuando 
 ## ⚡ 10 segundos hasta el primer insight
 
 ```bash
-uvx django-orm-lens scan      # or: pipx run django-orm-lens scan
+uvx django-orm-lens scan -f table   # every app and model at a glance
+uvx django-orm-lens nplusone        # N+1 loops, with the select_related to add
+uvx django-orm-lens migration-risk  # migrations that lock tables or fail on existing rows
 ```
 
-Un clon en frío, un venv roto, sin módulo de settings — aun así obtienes cada aplicación, modelo, campo y relación del proyecto en tu terminal.
+Un clon en frío, un venv roto, sin módulo de settings — aun así ves cada aplicación y modelo del proyecto, y después los bucles N+1 y las migraciones de riesgo, en tu terminal. (`uvx` viene de [uv](https://docs.astral.sh/uv/); `pipx run` funciona igual.)
 
 **Después elige tu superficie** — tres distribuciones, un mismo núcleo de análisis:
 
@@ -304,7 +306,7 @@ Insignias de `FileDecorationProvider`: `!` roja en FK sin `on_delete`, `~` amari
 ## 📸 Cómo se ve
 
 <div align="center" markdown="1">
-<img src="../../media/hero.png" alt="Barra lateral de Django ORM Lens mostrando los modelos de una aplicación con campos, relaciones y opciones Meta" width="90%"/>
+<img src="../../media/screenshot-vscode.png" alt="VS Code con Django ORM Lens: árbol de modelos, diagnósticos del ORM en views.py y el diagrama ER en vivo" width="100%"/>
 </div>
 
 **Ejemplo en vivo** — salida real de `django-orm-lens er`, renderizada por GitHub aquí mismo:
@@ -402,7 +404,7 @@ Las regresiones de esquema son más baratas de atrapar en el momento en que entr
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/FROWNINGdev/django-orm-lens
-    rev: py-v1.8.1
+    rev: py-v1.13.0
     hooks:
       - id: django-orm-lens-nplusone
       - id: django-orm-lens-migration-risk
@@ -661,7 +663,7 @@ Abre la paleta de comandos (`Ctrl+Shift+P` / `Cmd+Shift+P`) y escribe "Django OR
 **Siguiente**
 
 - [ ] Autocompletado de consultas ORM dentro de `.filter()` / `.exclude()` / `.annotate()` ([#3](https://github.com/FROWNINGdev/django-orm-lens/issues/3))
-- [ ] Casillas para activar/desactivar aplicaciones / modelos y despejar esquemas enormes
+- [x] **v0.10.0** — Casillas para activar/desactivar aplicaciones / modelos: al desmarcarlas en la barra lateral desaparecen del diagrama ER
 - [ ] Motor de reglas DOL portado a la CLI de Python — un catálogo de reglas, tres superficies
 
 **Más adelante**

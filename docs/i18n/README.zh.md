@@ -9,7 +9,7 @@
 
 # Django ORM Lens
 
-### Django 的数据结构智能层。
+### Django 的 ER 图、N+1 检测与迁移风险检查 —— 无需启动项目。
 
 你的整张模型图 —— 实时呈现在编辑器侧边栏、为你的 CI 把关，并通过 MCP 回答你的 AI agent 的提问。全部来自静态解析：无需数据库、无需 `runserver`、无需可用的 venv。
 
@@ -45,10 +45,12 @@
 ## ⚡ 10 秒获得第一份洞察
 
 ```bash
-uvx django-orm-lens scan      # or: pipx run django-orm-lens scan
+uvx django-orm-lens scan -f table   # every app and model at a glance
+uvx django-orm-lens nplusone        # N+1 loops, with the select_related to add
+uvx django-orm-lens migration-risk  # migrations that lock tables or fail on existing rows
 ```
 
-冷克隆、坏掉的 venv、没有 settings 模块 —— 项目的每个 app、模型、字段和关系依然会出现在你的终端里。
+冷克隆、坏掉的 venv、没有 settings 模块 —— 你依然能在终端里看到项目的每个 app 和模型，以及其中的 N+1 循环和高风险迁移。（`uvx` 来自 [uv](https://docs.astral.sh/uv/)；`pipx run` 用法相同。）
 
 **接着选择你的使用面** —— 三种发行形式，同一个解析器内核：
 
@@ -304,7 +306,7 @@ FK 上的 `.filter(field=?)` 自动追加 `.select_related(...)`，`.annotate(po
 ## 📸 界面预览
 
 <div align="center" markdown="1">
-<img src="../../media/hero.png" alt="Django ORM Lens sidebar showing an app's models with fields, relations, and Meta options" width="90%"/>
+<img src="../../media/screenshot-vscode.png" alt="VS Code with Django ORM Lens: the model tree, ORM diagnostics in views.py and the live ER diagram" width="100%"/>
 </div>
 
 **实时示例** — `django-orm-lens er` 的真实输出，GitHub 会直接在此渲染：
@@ -402,7 +404,7 @@ django-orm-lens mcp
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/FROWNINGdev/django-orm-lens
-    rev: py-v1.8.1
+    rev: py-v1.13.0
     hooks:
       - id: django-orm-lens-nplusone
       - id: django-orm-lens-migration-risk

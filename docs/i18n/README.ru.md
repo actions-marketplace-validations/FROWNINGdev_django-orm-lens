@@ -9,7 +9,7 @@
 
 # Django ORM Lens
 
-### Слой schema intelligence для Django.
+### ER-диаграммы, поиск N+1 и проверка риска миграций для Django — без запуска проекта.
 
 Весь ваш граф моделей — вживую в боковой панели редактора, на страже вашего CI и в ответах вашему AI-агенту через MCP. Всё это — из статического парсинга: без базы данных, без `runserver`, без рабочего venv.
 
@@ -45,10 +45,12 @@
 ## ⚡ 10 секунд до первого инсайта
 
 ```bash
-uvx django-orm-lens scan      # or: pipx run django-orm-lens scan
+uvx django-orm-lens scan -f table   # every app and model at a glance
+uvx django-orm-lens nplusone        # N+1 loops, with the select_related to add
+uvx django-orm-lens migration-risk  # migrations that lock tables or fail on existing rows
 ```
 
-Холодный клон, сломанный venv, нет settings-модуля — вы всё равно получаете каждое приложение, модель, поле и связь проекта прямо у себя в терминале.
+Холодный клон, сломанный venv, нет settings-модуля — вы всё равно видите все приложения и модели проекта, а затем N+1 в циклах и опасные миграции, прямо в терминале. (`uvx` — из [uv](https://docs.astral.sh/uv/); `pipx run` работает так же.)
 
 **Затем выберите свою поверхность** — три дистрибутива, одно ядро парсера:
 
@@ -304,7 +306,7 @@ docker run --rm -v "$PWD:/workspace" ghcr.io/frowningdev/django-orm-lens scan --
 ## 📸 Как это выглядит
 
 <div align="center" markdown="1">
-<img src="../../media/hero.png" alt="Django ORM Lens sidebar showing an app's models with fields, relations, and Meta options" width="90%"/>
+<img src="../../media/screenshot-vscode.png" alt="VS Code with Django ORM Lens: the model tree, ORM diagnostics in views.py and the live ER diagram" width="100%"/>
 </div>
 
 **Живой пример** — настоящий вывод `django-orm-lens er`, GitHub рендерит его прямо здесь:
@@ -402,7 +404,7 @@ django-orm-lens mcp
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/FROWNINGdev/django-orm-lens
-    rev: py-v1.8.1
+    rev: py-v1.13.0
     hooks:
       - id: django-orm-lens-nplusone
       - id: django-orm-lens-migration-risk
