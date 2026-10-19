@@ -440,6 +440,24 @@ paths return a structured envelope
 so the agent can self-correct. Optional sandbox via
 `DJANGO_ORM_LENS_ALLOWED_ROOTS` (`;`-separated on Windows, `:` elsewhere).
 
+### Agent skill
+
+The tools tell an agent what is true; the skill tells it what to do with
+that. [`skills/django-orm-lens`](skills/django-orm-lens) is a SKILL.md
+package with playbooks for migration review, safe renames and removals,
+N+1 fixes and cascade checks, a safe rewrite for each of the 16 migration
+rules, and `audit.py` for a one-command verdict (BLOCK / FIX BEFORE DEPLOY /
+SHIP). It uses the MCP server when connected and falls back to the CLI via
+`uvx`.
+
+- Install from [Agensi](https://www.agensi.io/skills/django-orm-lens-n-1-migration-safety-schema-map) (free), or
+- copy the folder into your agent's skills directory, e.g. for Claude Code:
+
+```bash
+git clone --depth 1 https://github.com/FROWNINGdev/django-orm-lens
+cp -r django-orm-lens/skills/django-orm-lens ~/.claude/skills/
+```
+
 <br/>
 
 ## 🛡️ Gate your CI
@@ -480,7 +498,7 @@ The comment goes up **before** the job fails, so a blocked PR still explains why
 # .pre-commit-config.yaml
 repos:
   - repo: https://github.com/FROWNINGdev/django-orm-lens
-    rev: py-v1.13.1
+    rev: py-v1.13.4
     hooks:
       - id: django-orm-lens-nplusone
       - id: django-orm-lens-migration-risk

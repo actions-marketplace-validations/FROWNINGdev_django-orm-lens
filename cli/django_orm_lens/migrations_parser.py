@@ -277,6 +277,9 @@ class MigrationRisk:
     mitigation: str
     confidence: Confidence
     severity: Severity
+    old_name: str | None = None
+    """For RenameField / RenameModel: the name before the rename, which is
+    what code that has not been updated still uses."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -487,6 +490,7 @@ class MigrationRiskAnalyzer:
         severity: Severity,
         model: str | None = None,
         field: str | None = None,
+        old_name: str | None = None,
     ) -> None:
         self.findings.append(
             MigrationRisk(
@@ -502,6 +506,7 @@ class MigrationRiskAnalyzer:
                 mitigation=mitigation,
                 confidence=confidence,
                 severity=severity,
+                old_name=old_name,
             )
         )
 
@@ -711,6 +716,7 @@ class MigrationRiskAnalyzer:
             severity="warning",
             model=model,
             field=new or old,
+            old_name=old,
         )
 
     def _check_RenameModel(self, call: ast.Call) -> None:
@@ -731,6 +737,7 @@ class MigrationRiskAnalyzer:
             confidence="medium",
             severity="warning",
             model=new or old,
+            old_name=old,
         )
 
     # ------------------------------------------------------------------
@@ -745,8 +752,9 @@ class MigrationRiskAnalyzer:
             "AddIndex",
             rule="add_index_locks_table",
             description=(
-                f"AddIndex on '{model}' takes an ACCESS EXCLUSIVE lock on "
-                f"Postgres for the duration of the build, blocking writes."
+                f"AddIndex on '{model}' takes a SHARE lock on Postgres for "
+                f"the index build and, in an atomic migration, until the "
+                f"enclosing transaction commits, blocking writes while reads continue."
             ),
             mitigation=(
                 "Use AddIndexConcurrently (Django 3.0+) inside a non-atomic "

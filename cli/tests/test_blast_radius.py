@@ -10,6 +10,8 @@ Run: python -m unittest discover cli/tests -v
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -71,6 +73,19 @@ class BlastRadiusTest(unittest.TestCase):
         target_file = str(FIXTURE / "blog" / "migrations" / "0002_drop_author.py")
         narrowed = analyze_blast_radius(FIXTURE, only_migrations=[target_file])
         self.assertEqual(len(narrowed.targets), 1)
+
+    def test_only_migrations_matches_project_and_cwd_relative_paths(self) -> None:
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(FIXTURE.parent)
+            for path in (
+                "blog/migrations/0002_drop_author.py",
+                "blast_radius/blog/migrations/0002_drop_author.py",
+            ):
+                report = analyze_blast_radius(FIXTURE, only_migrations=[path])
+                self.assertEqual(len(report.targets), 1, path)
+        finally:
+            os.chdir(previous_cwd)
 
     def test_cascade_is_absent_without_an_index(self) -> None:
         self.assertIsNone(self.report.targets[0].cascade)
@@ -136,6 +151,59 @@ class RenderingTest(unittest.TestCase):
         payload = json.loads(json.dumps(self.report.to_dict()))
         self.assertEqual(payload["summary"]["targets"], 1)
         self.assertIn("byLayer", payload["targets"][0]["impact"])
+
+
+class RenameBlastRadiusTest(unittest.TestCase):
+    """Regression: a rename breaks the code still using the *old* name."""
+
+    def _workspace(self, operation: str, views: str) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        app = Path(tmp.name) / "catalog"
+        (app / "migrations").mkdir(parents=True)
+        (app / "migrations" / "__init__.py").write_text("")
+        (app / "migrations" / "0001_initial.py").write_text(
+            "from django.db import migrations\n\n\n"
+            "class Migration(migrations.Migration):\n"
+            "    initial = True\n"
+            "    operations = []\n"
+        )
+        (app / "migrations" / "0002_rename.py").write_text(
+            "from django.db import migrations\n\n\n"
+            "class Migration(migrations.Migration):\n"
+            '    dependencies = [("catalog", "0001_initial")]\n'
+            f"    operations = [migrations.{operation}]\n"
+        )
+        (app / "views.py").write_text(views)
+        return Path(tmp.name)
+
+    def test_rename_field_scans_the_old_name(self) -> None:
+        root = self._workspace(
+            'RenameField(model_name="product", old_name="title", new_name="name")',
+            "def show(item):\n"
+            "    return item.product.title\n\n\n"
+            "def category(item):\n"
+            "    return item.product.category.name\n",
+        )
+        report = analyze_blast_radius(root)
+        self.assertEqual(len(report.targets), 1)
+        target = report.targets[0]
+        self.assertEqual(target.label, "catalog.product.name")
+        lines = [f.snippet for f in target.impact]
+        self.assertTrue(any("product.title" in line for line in lines), lines)
+        self.assertFalse(any("category.name" in line for line in lines), lines)
+
+    def test_rename_model_scans_the_old_name(self) -> None:
+        root = self._workspace(
+            'RenameModel(old_name="Product", new_name="Item")',
+            "from catalog.models import Product\n\n\n"
+            "def first():\n"
+            "    return Product.objects.first()\n",
+        )
+        report = analyze_blast_radius(root)
+        self.assertEqual(len(report.targets), 1)
+        lines = [f.snippet for f in report.targets[0].impact]
+        self.assertTrue(any("Product.objects" in line for line in lines), lines)
 
 
 class LayerOfTest(unittest.TestCase):

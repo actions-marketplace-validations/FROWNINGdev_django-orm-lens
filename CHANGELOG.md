@@ -7,6 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [py-1.13.4] - 2026-10-18
+
+### Fixed
+
+- **`cascade` skipped self-referential foreign keys (#147).** A
+  `ForeignKey("self")` on the deleted model (a category tree, a reply chain)
+  was left out of every bucket, so deleting a parent looked isolated while
+  Django would cascade through its children. Self-references now land in
+  CASCADE / SET_NULL / PROTECT like any other inbound relation, are marked
+  `"self": true` in JSON and `(self)` in the text output.
+
+- **`blast-radius --only` now accepts project-root-relative migration paths when
+  invoked from another directory (#149).** Paths relative to the current working
+  directory and absolute paths continue to work.
+
+- **`impact --format json` and the MCP `impact` tool reported 0-based line
+  numbers while the text output printed the same finding 1-based (#150).** A
+  reference on line 21 came back as `"line": 20`, so agents citing `file:line`
+  from JSON pointed one line above the real code. `ImpactFinding.to_dict()`
+  now serializes a 1-based `line` (the same number the text and markdown
+  renderers print), which also fixes `blast-radius --format json`. This is a
+  JSON contract change: consumers that added 1 themselves should stop.
+  `column` stays 0-based, and the in-memory `ImpactFinding.line` attribute
+  stays 0-based to match the VS Code extension and the LSP.
+
+- **Migration-risk AddIndex finding overstated PostgreSQL's lock mode (#151).**
+  Plain `AddIndex` now correctly reports a SHARE lock: writes block while reads
+  continue. `AlterUniqueTogether` and table-rewriting column type changes
+  continue to report ACCESS EXCLUSIVE.
+
+- **`blast-radius` scanned the new name for `RenameField` / `RenameModel`
+  (#148).** The code that breaks after a rename is the code still using the
+  old name, but the reference scan looked for the new one, so it missed those
+  references and listed unrelated lookalikes of the new name instead. Rename
+  targets now scan for the old name; the target label still shows the new
+  name.
+
+## [py-1.13.3] - 2026-10-14
+
+### Fixed
+
+- **The `impact` MCP tool rejected the `name` argument its description asks
+  for (#138).** The tool was registered with a `name_` parameter, so `tools/list`
+  advertised `name_` while the description said "Required 'name' argument",
+  and an agent passing `name` got `MISSING_NAME: pass 'name'`. The tool now
+  accepts `name`; `name_` keeps working for clients that learned it from the
+  old schema.
+
+## [0.19.4] - 2026-10-08
+
+### Fixed
+
+- **Models whose base class lives outside `models.py` disappeared (#135).**
+  `class Person(MyCustomModel)` with `MyCustomModel` in `core/base.py` was
+  missing from the sidebar, the ER diagram and every rule: only
+  `models.py`, `abstract_models.py` and `models/*.py` are read, so the base had
+  no definition and nothing below it was recognized as a model. The scan now
+  follows the subclass's imports to the file that defines the base — plain and
+  relative imports, `from core import base` aliases, and re-exports through a
+  package `__init__.py` — and inherited fields come along. Only classes that a
+  model actually inherits from are read from those files, and nothing outside
+  the workspace root is opened. Same fix as py-1.13.2.
+- **`djangoOrmLens.excludeGlobs` wildcard patterns other than `**/dir/**`
+  were matched as plain substrings**, so `**/*_test.py` excluded nothing in
+  the extension while the CLI's `fnmatch` excluded it. They now match the way
+  the CLI matches them.
+
+## [py-1.13.2] - 2026-10-08
+
+### Fixed
+
+- **Models whose base class lives outside `models.py` were dropped from
+  `scan` and every command built on it (#135).** A base in `core/base.py` or
+  any other non-model module had no definition to resolve against, so
+  `class Person(MyCustomModel)` vanished along with its fields. `scan_workspace`
+  now follows the subclass's imports — plain, relative, module aliases and
+  package re-exports — to the base's file, so the model, its inherited fields
+  and the MCP tools that read them are back. Only inherited-from classes are
+  read, and nothing outside the scan root is opened.
+
 ## [0.19.3] - 2026-10-06
 
 ### Fixed
