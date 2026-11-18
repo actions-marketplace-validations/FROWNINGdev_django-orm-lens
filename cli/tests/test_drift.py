@@ -1,4 +1,4 @@
-"""Tests for static schema-drift detection (django_orm_lens/drift.py).
+"""Tests for static schema-drift detection (orm_lens/drift.py).
 
 The replay has to be right in both directions, and the *blocking* decision has
 to stay narrow: only "code expects a column that will not exist" fails a
@@ -15,7 +15,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from django_orm_lens.drift import (
+from orm_lens.drift import (
     ADVISORY_MARK,
     BLOCKING_MARK,
     LEGEND_LINES,
@@ -45,8 +45,8 @@ class ReplayTest(unittest.TestCase):
         self.migrations = self.root / "blog" / "migrations"
         self.migrations.mkdir(parents=True)
 
-    def _write(self, name: str, body: str) -> None:
-        (self.migrations / name).write_text(_migration(body), encoding="utf-8")
+    def _write(self, name: str, body: str, deps: str = "[]") -> None:
+        (self.migrations / name).write_text(_migration(body, deps), encoding="utf-8")
 
     def test_create_model_seeds_the_field_set(self) -> None:
         self._write(
@@ -100,6 +100,199 @@ class ReplayTest(unittest.TestCase):
         state, _ = replay_app(self.migrations)
         self.assertEqual(state, {"article": {"title"}})
 
+    def test_state_operations_inside_a_wrapper_are_replayed(self) -> None:
+        # Django builds project state from `state_operations`; the wrapper is
+        # how a model moves between apps without touching the table, so what
+        # it contains has to count as migrated.
+        self._write(
+            "0001_initial.py",
+            "        migrations.SeparateDatabaseAndState(\n"
+            "            state_operations=[\n"
+            '                migrations.CreateModel(name="Entry", fields=[\n'
+            '                    ("action", None), ("message", None),\n'
+            "                ]),\n"
+            "            ],\n"
+            "            database_operations=[],\n"
+            "        ),\n",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action", "message"}})
+
+    def test_state_operations_are_read_positionally(self) -> None:
+        # SeparateDatabaseAndState(database_operations, state_operations).
+        self._write(
+            "0001_initial.py",
+            "        migrations.SeparateDatabaseAndState(\n"
+            "            [],\n"
+            "            [migrations.CreateModel(name='Entry', fields=[('action', None)])],\n"
+            "        ),\n",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
+    def test_database_operations_do_not_change_state(self) -> None:
+        # `database_operations` are SQL-only; Django's state never sees them.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="Post", fields=[("title", None)]),\n',
+        )
+        self._write(
+            "0002_x.py",
+            "        migrations.SeparateDatabaseAndState(\n"
+            "            state_operations=[],\n"
+            "            database_operations=[\n"
+            '                migrations.RenameModel(old_name="Post", new_name="Article"),\n'
+            "            ],\n"
+            "        ),\n",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"post": {"title"}})
+
+    def test_state_operations_bound_to_a_module_level_name_are_replayed(self) -> None:
+        # Hand-written migrations hoist a shared list into a constant; the
+        # wrapper still has to be followed through the name.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "STATE_OPERATIONS = [\n"
+            + "    migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "]\n\n\n"
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(\n"
+            + "            state_operations=STATE_OPERATIONS,\n"
+            + "        ),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
+    def test_state_operations_bound_to_a_class_level_name_are_replayed(self) -> None:
+        # Django's own docs put the shared list on the Migration class rather
+        # than at module level, so the name is only bound inside the class body.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    state_operations = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(\n"
+            + "            state_operations=state_operations,\n"
+            + "        ),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
+    def test_state_operations_ignore_a_class_level_name_bound_again_below(self) -> None:
+        # `state_operations=STATE` keeps the list STATE named at that point; a
+        # later `STATE = []` (bound to keep it away from the next migration in
+        # the same class) is a different object by then. Reading the last
+        # binding replayed the empty list, dropped the model, and that read as
+        # drift on a project Django sees no drift on.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE),\n"
+            + "    ]\n"
+            + "    STATE = []\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
+    def test_state_operations_rebinding_to_an_empty_list_is_not_replayed(self) -> None:
+        # `STATE = EMPTY` replaces the class name before the wrapper reads it,
+        # so Python hands the wrapper an empty list. Keeping the first binding
+        # replays a model Django never sees, which reads as false drift.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    EMPTY = []\n"
+            + "    STATE = EMPTY\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {})
+
+    def test_state_operations_rebinding_to_a_call_shadows_the_module_name(self) -> None:
+        # A class body that rebinds the name to something unresolvable still
+        # shadows a module-level list of the same spelling for the rest of the
+        # body. Falling back to the module binding replays operations the
+        # wrapper never received.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "STATE_OPS = [\n"
+            + "    migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "]\n\n\n"
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE_OPS = build_state_operations()\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE_OPS),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {})
+
+    def test_state_operations_nested_wrappers_resolve_where_they_were_built(self) -> None:
+        # The second STATE captures the first list. Resolving the inner name
+        # against the final mapping finds the outer list instead and recurses
+        # into it forever.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    STATE = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE),\n"
+            + "    ]\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=STATE),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
+    def test_state_operations_alias_replays_the_list_it_points_at(self) -> None:
+        # `COPY = STATE` is the same list object, so a wrapper reading COPY
+        # replays what STATE held when COPY was bound.
+        (self.migrations / "0001_initial.py").write_text(
+            HEADER
+            + "class Migration(migrations.Migration):\n"
+            + "    dependencies = []\n"
+            + "    STATE = [\n"
+            + "        migrations.CreateModel(name='Entry', fields=[('action', None)]),\n"
+            + "    ]\n"
+            + "    COPY = STATE\n"
+            + "    operations = [\n"
+            + "        migrations.SeparateDatabaseAndState(state_operations=COPY),\n"
+            + "    ]\n",
+            encoding="utf-8",
+        )
+        state, _ = replay_app(self.migrations)
+        self.assertEqual(state, {"entry": {"action"}})
+
     def test_delete_model_drops_it(self) -> None:
         self._write(
             "0001_initial.py",
@@ -137,6 +330,79 @@ class ReplayTest(unittest.TestCase):
         )
         self.assertEqual(replay_app(self.migrations)[0], {"post": {"title"}})
 
+    def test_hand_renamed_migration_keeps_its_place(self) -> None:
+        # Django loads any module in the package, so `0001b_` is a real
+        # migration. It has to replay *after* `0001_initial`: sorting it as -1
+        # puts it first and the CreateModel that follows resets the field set.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="CachedFile", fields=['
+            '("filename", None)]),\n',
+        )
+        self._write(
+            "0001b_add_session_key.py",
+            '        migrations.AddField(model_name="cachedfile",'
+            ' name="session_key", field=models.TextField(null=True)),\n',
+            deps="[('blog', '0001_initial')]",
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 2)
+        self.assertEqual(state, {"cachedfile": {"filename", "session_key"}})
+
+    def test_dependency_only_name_replays_after_its_parent(self) -> None:
+        # `add_slug.py` has no numeric prefix at all — Django applies it where
+        # its `dependencies` say, which is after `0001_initial`. Applying it
+        # first added the field to an empty state that CreateModel then reset.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="Post", fields=[("title", None)]),\n',
+        )
+        self._write(
+            "add_slug.py",
+            '        migrations.AddField(model_name="post", name="slug",'
+            " field=models.SlugField()),\n",
+            deps="[('blog', '0001_initial')]",
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 2)
+        self.assertEqual(state, {"post": {"title", "slug"}})
+
+    def test_cross_app_dependency_is_not_a_local_edge(self) -> None:
+        # `0001_initial` depends on `other/add_slug`, an app that is not this
+        # one; `add_slug.py` here merely shares the name. Matching on the name
+        # alone turned that into a local edge and, with `add_slug` depending on
+        # `0001_initial` back, a cycle whose fallback put `add_slug` first —
+        # where the later CreateModel reset its field.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="Post", fields=[("title", None)]),\n',
+            deps="[('other', 'add_slug')]",
+        )
+        self._write(
+            "add_slug.py",
+            '        migrations.AddField(model_name="post", name="slug",'
+            " field=models.SlugField()),\n",
+            deps="[('blog', '0001_initial')]",
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 2)
+        self.assertEqual(state, {"post": {"title", "slug"}})
+
+    def test_helper_module_without_migration_class_is_not_replayed(self) -> None:
+        # `MIGRATION_FILENAME_RE` now accepts any module Django would import,
+        # which also picks up constants/mixins. They are not migrations and
+        # must not count towards `replayed`.
+        self._write(
+            "0001_initial.py",
+            '        migrations.CreateModel(name="Post", fields=[("title", None)]),\n',
+        )
+        (self.migrations / "constants.py").write_text(
+            "FIELDS = ('title',)\n", encoding="utf-8"
+        )
+        state, replayed = replay_app(self.migrations)
+        self.assertEqual(replayed, 1)
+        self.assertEqual(state, {"post": {"title"}})
+
     def test_unparseable_migration_is_skipped_not_fatal(self) -> None:
         self._write(
             "0001_initial.py",
@@ -168,11 +434,59 @@ class DetectDriftTest(unittest.TestCase):
     def _detect(self, declared: dict) -> DriftReport:
         return detect_drift(self.root, declared=declared)
 
+    def test_model_created_inside_a_wrapper_reports_no_drift(self) -> None:
+        # A model moved between apps (or created without touching the table)
+        # lives in `state_operations`; drift must see it like Django does.
+        audit = self.root / "audit" / "migrations"
+        audit.mkdir(parents=True)
+        (audit / "0001_initial.py").write_text(
+            _migration(
+                "        migrations.SeparateDatabaseAndState(\n"
+                "            state_operations=[\n"
+                '                migrations.CreateModel(name="Entry", fields=[\n'
+                '                    ("id", None), ("action", None), ("message", None),\n'
+                "                ]),\n"
+                "            ],\n"
+                "        ),\n"
+            ),
+            encoding="utf-8",
+        )
+        report = self._detect(
+            {
+                "blog": {"post": {"id", "title"}},
+                "audit": {"entry": {"id", "action", "message"}},
+            }
+        )
+        self.assertEqual(report.drifted, [])
+
     def test_matching_schema_reports_no_drift(self) -> None:
         report = self._detect({"blog": {"post": {"id", "title"}}})
         self.assertEqual(report.drifted, [])
         self.assertEqual(report.blocking_count, 0)
         self.assertIn("no drift", format_drift(report))
+
+    def test_directly_imported_array_field_matches_migration(self) -> None:
+        blog = self.root / "blog"
+        (blog / "models.py").write_text(
+            "from django.contrib.postgres.fields import ArrayField\n"
+            "from django.db import models\n\n"
+            "class Post(models.Model):\n"
+            "    title = models.CharField(max_length=100)\n"
+            "    tags = ArrayField(models.TextField(), default=list)\n",
+            encoding="utf-8",
+        )
+        (blog / "migrations" / "0002_add_tags.py").write_text(
+            "from django.contrib.postgres.fields import ArrayField\n"
+            + _migration(
+                '        migrations.AddField(model_name="post", name="tags", '
+                "field=ArrayField(models.TextField(), default=list)),\n",
+                '[("blog", "0001_initial")]',
+            ),
+            encoding="utf-8",
+        )
+
+        report = detect_drift(self.root)
+        self.assertEqual(report.drifted, [])
 
     def test_declared_but_unmigrated_field_blocks(self) -> None:
         report = self._detect({"blog": {"post": {"title", "slug"}}})

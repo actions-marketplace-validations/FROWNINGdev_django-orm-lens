@@ -18,7 +18,7 @@ const RELATION_TYPES: RelationKind[] = [
 // django-mptt's Tree* fields are thin subclasses of Django's own relation
 // fields — same `to`, same `on_delete`, same `related_name`. Mapping the name
 // to its Django counterpart is the whole fix: every extractor below keeps
-// working unchanged. Mirrors TREE_FIELD_ALIASES in cli/django_orm_lens/parser.py;
+// working unchanged. Mirrors TREE_FIELD_ALIASES in cli/orm_lens/parser.py;
 // the two must stay in step or the sidebar and the CLI disagree about a schema.
 const TREE_FIELD_ALIASES: Record<string, RelationKind> = {
   TreeForeignKey: 'ForeignKey',
@@ -78,7 +78,7 @@ export function resolveRelatedTail(
  * This is only the seed. `resolveAndFilter` grows the set transitively, so a
  * project-local base under any other name — `TimeStamped`, `BaseModel`,
  * `Auditable` — still makes its subclasses models once the base itself is
- * recognised. Mirrors `_looks_like_model` in cli/django_orm_lens/parser.py.
+ * recognised. Mirrors `_looks_like_model` in cli/orm_lens/parser.py.
  */
 const NON_MODEL_TAIL =
   /^(ModelAdmin|ModelForm|ModelSerializer|ModelChoiceField|ModelMultipleChoiceField|Serializer|Form|Admin|View|ViewSet|Manager|QuerySet|Config|AppConfig|Response|Handler|Middleware|Backend|Command)$/;
@@ -137,6 +137,10 @@ function detectClassIndent(lines: string[], classLineIdx: number): number {
   return 4;
 }
 
+// `models.Manager()` and `models.QuerySet()` declare managers, not columns.
+// FIELD_RE matches any `models.<Name>(`, so skip these in the model body.
+const NOT_A_FIELD_TYPES = new Set(['Manager', 'QuerySet']);
+
 const BARE_FIELD_TYPES = [
   'CharField', 'TextField', 'SlugField', 'EmailField', 'URLField', 'UUIDField',
   'IntegerField', 'BigIntegerField', 'SmallIntegerField',
@@ -145,6 +149,11 @@ const BARE_FIELD_TYPES = [
   'BooleanField', 'NullBooleanField',
   'DateTimeField', 'DateField', 'TimeField', 'DurationField',
   'JSONField', 'BinaryField',
+  'GeneratedField',
+  'ArrayField', 'HStoreField', 'SearchVectorField',
+  'IntegerRangeField', 'BigIntegerRangeField', 'DecimalRangeField',
+  'DateRangeField', 'DateTimeRangeField',
+  'CICharField', 'CIEmailField', 'CITextField',
   'FileField', 'ImageField', 'FilePathField',
   'GenericIPAddressField',
   'AutoField', 'BigAutoField', 'SmallAutoField',
@@ -152,6 +161,56 @@ const BARE_FIELD_TYPES = [
   'TaggableManager',
   'TreeForeignKey', 'TreeOneToOneField', 'TreeManyToManyField',
 ].join('|');
+
+const BARE_FIELD_NAMES = new Set(BARE_FIELD_TYPES.split('|'));
+const FIELD_IMPORT_RE =
+  /^from\s+(?:django\.db\.models(?:\.[\w.]+)?|django\.contrib\.postgres\.(?:fields(?:\.[\w.]+)?|search))\s+import\s+/;
+const IMPORT_ALIAS_RE = /^([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)$/;
+
+function linesInsideStrings(lines: string[]): Set<number> {
+  const inside = new Set<number>();
+  let quote = '';
+  const quoteOrComment = /\\.|'''|"""|['"#]/g;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (quote) inside.add(i);
+    for (const token of line.matchAll(quoteOrComment)) {
+      const value = token[0];
+      if (quote) {
+        if (value === quote || (quote.length === 1 && value.startsWith(quote))) quote = '';
+      } else if (value === '#') {
+        break;
+      } else if (!value.startsWith('\\')) {
+        quote = value;
+      }
+    }
+    if (quote.length === 1 && !line.endsWith('\\')) quote = '';
+  }
+  return inside;
+}
+
+function fieldImportAliases(lines: string[], insideStrings: Set<number>): Map<string, string> {
+  const aliases = new Map<string, string>();
+  for (let i = 0; i < lines.length; i++) {
+    if (insideStrings.has(i)) continue;
+    const line = lines[i];
+    const match = line.match(FIELD_IMPORT_RE);
+    if (!match) continue;
+    let names = line.slice(match[0].length).split('#')[0].trim();
+    if (names.startsWith('(')) {
+      let j = i;
+      while (!names.includes(')') && j + 1 < lines.length) {
+        names += ' ' + lines[++j].split('#')[0];
+      }
+      names = names.slice(1).split(')')[0];
+    }
+    for (const name of names.split(',')) {
+      const alias = name.trim().match(IMPORT_ALIAS_RE);
+      if (alias && BARE_FIELD_NAMES.has(alias[1])) aliases.set(alias[2], alias[1]);
+    }
+  }
+  return aliases;
+}
 
 function buildBodyRegexes(indent: number) {
   const w = `\\s{${indent}}`;
@@ -173,6 +232,13 @@ function buildBodyRegexes(indent: number) {
     ),
     BARE_FIELD_RE: new RegExp(
       `^${w}([a-zA-Z_][a-zA-Z0-9_]*)${ann}\\s*=\\s*${prefixOpt}(${BARE_FIELD_TYPES})\\s*\\(`
+    ),
+    ALIASED_FIELD_RE: new RegExp(
+      `^${w}([a-zA-Z_][a-zA-Z0-9_]*)${ann}\\s*=\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*\\(`
+    ),
+    // `a = None` or chained `a = b = None`; group 1 holds the targets.
+    REMOVED_RE: new RegExp(
+      `^${w}([a-zA-Z_][a-zA-Z0-9_]*(?:\\s*=\\s*[a-zA-Z_][a-zA-Z0-9_]*)*)${ann}\\s*=\\s*None\\s*(?:#.*)?$`
     ),
     META_START_RE: new RegExp(`^${w}class\\s+Meta\\s*(?:\\([^)]*\\))?\\s*:`),
     META_ITEM_RE: new RegExp(
@@ -210,12 +276,24 @@ function extractRelated(argsBlock: string): string | undefined {
   return raw.replace(/^['"]|['"]$/g, '');
 }
 
-function extractOnDelete(argsBlock: string): string | undefined {
+function extractOnDelete(
+  argsBlock: string,
+  positional = true
+): string | undefined {
   const m = argsBlock.match(
     /on_delete\s*=\s*(?:models\.)?([A-Z][A-Z_]+)/
   );
   if (m) return m[1];
   if (argsBlock.match(/on_delete\s*=\s*(?:models\.)?SET\s*\(/)) return 'SET';
+  if (!positional) return undefined;
+  // ForeignKey(to, on_delete, ...): the second positional argument is
+  // on_delete, and Django's own contrib apps pass it that way. Not for
+  // ManyToManyField, whose second positional is related_name.
+  const p = argsBlock.match(
+    /^\s*[^,=()[\]]+,\s*(?:[\w.]+\.)?([A-Z][A-Z_]*)\s*(?:[,)]|$)/
+  );
+  if (p) return p[1];
+  if (/^\s*[^,=()[\]]+,\s*(?:[\w.]+\.)?SET\s*\(/.test(argsBlock)) return 'SET';
   return undefined;
 }
 
@@ -238,23 +316,49 @@ function readBalancedArgs(lines: string[], startIdx: number): {
   endIdx: number;
 } {
   const openIdx = lines[startIdx].indexOf('(');
-  let depth = 0;
-  let buffer = '';
+  if (openIdx === -1) return { argsBlock: '', endIdx: startIdx };
+
+  let depth = 1;
+  let quote = '';
+  const parts: string[] = [];
   for (let i = startIdx; i < lines.length; i++) {
-    const src = i === startIdx ? lines[i].slice(openIdx) : lines[i];
-    for (const ch of src) {
-      if (ch === '(') depth++;
-      else if (ch === ')') {
+    const src = i === startIdx ? lines[i].slice(openIdx + 1) : lines[i];
+    let k = 0;
+    while (k < src.length) {
+      const ch = src[k];
+      if (quote) {
+        if (ch === '\\') {
+          k += 2;
+          continue;
+        }
+        if (src.startsWith(quote, k)) {
+          k += quote.length;
+          quote = '';
+          continue;
+        }
+      } else if (ch === '#') {
+        break;
+      } else if (ch === "'" || ch === '"') {
+        const triple = ch.repeat(3);
+        quote = src.startsWith(triple, k) ? triple : ch;
+        k += quote.length;
+        continue;
+      } else if (ch === '(') {
+        depth++;
+      } else if (ch === ')') {
         depth--;
         if (depth === 0) {
-          return { argsBlock: (buffer + ')').replace(/^\(/, ''), endIdx: i };
+          parts.push(src.slice(0, k + 1));
+          return { argsBlock: parts.join(''), endIdx: i };
         }
       }
-      buffer += ch;
+      k++;
     }
-    buffer += '\n';
+    // A single-quoted string can continue only via an escaped newline.
+    if (quote.length === 1 && k <= src.length) quote = '';
+    parts.push(src, '\n');
   }
-  return { argsBlock: buffer.replace(/^\(/, ''), endIdx: lines.length - 1 };
+  return { argsBlock: parts.join(''), endIdx: lines.length - 1 };
 }
 
 /**
@@ -263,7 +367,7 @@ function readBalancedArgs(lines: string[], startIdx: number): {
  * No model recognition, no abstract filtering, no inheritance. Callers combine
  * the result with definitions from other files before calling
  * `resolveAndFilter`, so a base declared in another module is still found.
- * Mirrors `_collect_defs` in cli/django_orm_lens/parser.py.
+ * Mirrors `_collect_defs` in cli/orm_lens/parser.py.
  */
 export function collectDefs(filePath: string, content: string): ParsedModel[] {
   // Strip leading BOM (U+FEFF) — Windows editors (Notepad, VS Code with
@@ -279,6 +383,8 @@ export function collectDefs(filePath: string, content: string): ParsedModel[] {
   const lines = content
     .split(/\r?\n/)
     .map((l) => l.replace(/\t/g, '    '));
+  const insideStrings = linesInsideStrings(lines);
+  const fieldAliases = fieldImportAliases(lines, insideStrings);
   const models: ParsedModel[] = [];
   const parent = path.basename(path.dirname(filePath));
   const appName =
@@ -286,6 +392,10 @@ export function collectDefs(filePath: string, content: string): ParsedModel[] {
 
   let i = 0;
   while (i < lines.length) {
+    if (insideStrings.has(i)) {
+      i++;
+      continue;
+    }
     const line = lines[i];
     let classMatch = line.match(CLASS_RE);
     let classHeaderEnd = i;
@@ -318,13 +428,29 @@ export function collectDefs(filePath: string, content: string): ParsedModel[] {
     };
 
     const indent = detectClassIndent(lines, classHeaderEnd);
-    const { FIELD_RE, BARE_FIELD_RE, META_START_RE, META_ITEM_RE, META_BODY_RE } =
-      buildBodyRegexes(indent);
+    const {
+      FIELD_RE,
+      BARE_FIELD_RE,
+      ALIASED_FIELD_RE,
+      REMOVED_RE,
+      META_START_RE,
+      META_ITEM_RE,
+      META_BODY_RE,
+    } = buildBodyRegexes(indent);
 
     let j = classHeaderEnd + 1;
     while (j < lines.length) {
+      if (insideStrings.has(j)) {
+        j++;
+        continue;
+      }
       const innerLine = lines[j];
       if (/^class\s+/.test(innerLine) && !/^\s+class/.test(innerLine)) {
+        break;
+      }
+      // A column-0 function, block or decorator ends the class too, as in the
+      // Python parser (#226), so its body is not read as class attributes.
+      if (COLUMN0_STATEMENT_RE.test(innerLine)) {
         break;
       }
       if (innerLine.trim().length === 0) {
@@ -336,6 +462,10 @@ export function collectDefs(filePath: string, content: string): ParsedModel[] {
       if (metaStart) {
         let k = j + 1;
         while (k < lines.length) {
+          if (insideStrings.has(k)) {
+            k++;
+            continue;
+          }
           const metaLine = lines[k];
           if (metaLine.length && !META_BODY_RE.test(metaLine) && metaLine.trim().length > 0) break;
           const m = metaLine.match(META_ITEM_RE);
@@ -348,11 +478,27 @@ export function collectDefs(filePath: string, content: string): ParsedModel[] {
         continue;
       }
 
-      const fieldMatch = innerLine.match(FIELD_RE) ?? innerLine.match(BARE_FIELD_RE);
+      const removed = innerLine.match(REMOVED_RE);
+      if (removed) {
+        // `name = None` drops a field inherited from an abstract base.
+        (model.removedFields ??= []).push(...removed[1].split(/\s*=\s*/));
+        j++;
+        continue;
+      }
+
+      const aliasMatch = fieldAliases.size ? innerLine.match(ALIASED_FIELD_RE) : null;
+      const aliasedType = aliasMatch && fieldAliases.get(aliasMatch[2]);
+      const fieldMatch = aliasedType
+        ? aliasMatch
+        : innerLine.match(FIELD_RE) ?? innerLine.match(BARE_FIELD_RE);
       if (fieldMatch) {
         const fieldName = fieldMatch[1];
-        const fieldType = fieldMatch[2];
+        const fieldType = aliasedType || fieldMatch[2];
         const { argsBlock, endIdx } = readBalancedArgs(lines, j);
+        if (NOT_A_FIELD_TYPES.has(fieldType)) {
+          j = endIdx + 1;
+          continue;
+        }
         const relationKind =
           fieldType === 'TaggableManager'
             ? 'ManyToManyField'
@@ -375,7 +521,10 @@ export function collectDefs(filePath: string, content: string): ParsedModel[] {
             fieldType === 'TaggableManager'
               ? 'taggit.Tag'
               : extractRelated(argsInner);
-          const onDelete = extractOnDelete(argsInner);
+          const onDelete = extractOnDelete(
+            argsInner,
+            relationKind !== 'ManyToManyField'
+          );
           if (onDelete) field.onDelete = onDelete;
           const relatedName = extractRelatedName(argsInner);
           if (relatedName) field.relatedName = relatedName;
@@ -408,6 +557,67 @@ function isAbstract(model: ParsedModel): boolean {
   return ['True', '1', 'true'].includes((model.meta.abstract ?? '').trim());
 }
 
+/** Mirrors `_COLUMN0_STATEMENT_RE` in cli/orm_lens/parser.py. */
+const COLUMN0_STATEMENT_RE =
+  /^(?:(?:if|elif|while|for|try|with|async\s+(?:def|for|with)|def)\b|(?:else|except|finally)\b|@)/;
+
+const djangoField = (name: string, type: string, args: string, inheritedFrom: string): ParsedField => ({
+  name,
+  type,
+  args,
+  isRelation: false,
+  lineNumber: 0,
+  inheritedFrom,
+});
+
+const authM2m = (name: string, target: string): ParsedField => ({
+  name,
+  type: 'ManyToManyField',
+  args: `"${target}", blank=True, related_name="user_set", related_query_name="user"`,
+  isRelation: true,
+  relatedModel: target,
+  relationKind: 'ManyToManyField',
+  relatedName: 'user_set',
+  lineNumber: 0,
+  inheritedFrom: 'PermissionsMixin',
+});
+
+const ABSTRACT_BASE_USER = [
+  djangoField('password', 'CharField', 'max_length=128', 'AbstractBaseUser'),
+  djangoField('last_login', 'DateTimeField', 'blank=True, null=True', 'AbstractBaseUser'),
+];
+const PERMISSIONS_MIXIN = [
+  djangoField('is_superuser', 'BooleanField', 'default=False', 'PermissionsMixin'),
+  authM2m('groups', 'auth.Group'),
+  authM2m('user_permissions', 'auth.Permission'),
+];
+
+/**
+ * Fields of `django.contrib.auth`'s abstract bases, which live in
+ * site-packages where a workspace scan never looks. `is_active` on
+ * `AbstractBaseUser` is a plain class attribute, not a field. A workspace class
+ * of the same name wins. Mirrors `DJANGO_ABSTRACT_BASES` in
+ * cli/orm_lens/parser.py.
+ */
+const DJANGO_ABSTRACT_BASES = new Map<string, readonly ParsedField[]>([
+  ['AbstractBaseUser', ABSTRACT_BASE_USER],
+  ['PermissionsMixin', PERMISSIONS_MIXIN],
+  [
+    'AbstractUser',
+    [
+      ...ABSTRACT_BASE_USER,
+      ...PERMISSIONS_MIXIN,
+      djangoField('username', 'CharField', 'max_length=150, unique=True', 'AbstractUser'),
+      djangoField('first_name', 'CharField', 'max_length=150, blank=True', 'AbstractUser'),
+      djangoField('last_name', 'CharField', 'max_length=150, blank=True', 'AbstractUser'),
+      djangoField('email', 'EmailField', 'blank=True', 'AbstractUser'),
+      djangoField('is_staff', 'BooleanField', 'default=False', 'AbstractUser'),
+      djangoField('is_active', 'BooleanField', 'default=True', 'AbstractUser'),
+      djangoField('date_joined', 'DateTimeField', 'default=timezone.now', 'AbstractUser'),
+    ],
+  ],
+]);
+
 /**
  * Fields `model` inherits from its **abstract** bases, parent-first.
  *
@@ -418,10 +628,11 @@ function isAbstract(model: ParsedModel): boolean {
  *
  * Bases are walked in declaration order and the first declaration of a name
  * wins, which is the direction Python's MRO resolves for the single-
- * inheritance chains this actually matters for. `stack` breaks cycles in
- * malformed source instead of recursing forever.
+ * inheritance chains this actually matters for. A parent's own field, or its
+ * `name = None`, hides that name from the parent's ancestors. `stack` breaks
+ * cycles in malformed source instead of recursing forever.
  *
- * Mirrors `_abstract_bases_fields` in cli/django_orm_lens/parser.py.
+ * Mirrors `_abstract_bases_fields` in cli/orm_lens/parser.py.
  */
 function abstractBasesFields(
   model: ParsedModel,
@@ -434,14 +645,21 @@ function abstractBasesFields(
     const tail = base.split('.').pop() ?? '';
     if (stack.includes(tail)) continue;
     const parent = byName.get(tail);
-    if (!parent || parent === model || !isAbstract(parent)) continue;
-    const contributed: ParsedField[] = [
-      ...abstractBasesFields(parent, byName, [...stack, tail]),
-      ...parent.fields.map((f) => ({
-        ...f,
-        inheritedFrom: f.inheritedFrom ?? parent.name,
-      })),
-    ];
+    let contributed: ParsedField[];
+    if (!parent) {
+      contributed = (DJANGO_ABSTRACT_BASES.get(tail) ?? []).map((f) => ({ ...f }));
+    } else if (parent === model || !isAbstract(parent)) {
+      continue;
+    } else {
+      const hidden = new Set([...parent.fields.map((f) => f.name), ...(parent.removedFields ?? [])]);
+      contributed = [
+        ...abstractBasesFields(parent, byName, [...stack, tail]).filter((f) => !hidden.has(f.name)),
+        ...parent.fields.map((f) => ({
+          ...f,
+          inheritedFrom: f.inheritedFrom ?? parent.name,
+        })),
+      ];
+    }
     for (const f of contributed) {
       if (taken.has(f.name)) continue;
       taken.add(f.name);
@@ -467,7 +685,7 @@ function attachInheritedFields(allDefs: ParsedModel[]): void {
     if (!byName.has(m.name)) byName.set(m.name, m);
   }
   for (const m of allDefs) {
-    const own = new Set(m.fields.map((f) => f.name));
+    const own = new Set([...m.fields.map((f) => f.name), ...(m.removedFields ?? [])]);
     m.inheritedFields = abstractBasesFields(m, byName).filter((f) => !own.has(f.name));
   }
 }
@@ -483,7 +701,7 @@ function attachInheritedFields(allDefs: ParsedModel[]): void {
  * The loop runs to a **fixed point** rather than in source order. Order-
  * dependent recognition misses `class Post(TimeStamped)` written above its
  * base, which is ordinary once the base is imported rather than declared
- * locally. Mirrors `_resolve_and_filter` in cli/django_orm_lens/parser.py; the
+ * locally. Mirrors `_resolve_and_filter` in cli/orm_lens/parser.py; the
  * two must stay in step or the sidebar and the CLI disagree about a schema.
  */
 export function resolveAndFilter(allDefs: ParsedModel[]): ParsedModel[] {
@@ -586,7 +804,7 @@ function fnmatchRegex(pattern: string): RegExp {
  * subclasses — django-oscar does this in all 14 of its apps. Without reading
  * these, oscar's models parse as classes with no fields between them: found,
  * but empty, which reads as a schema that lost its columns. Mirrors
- * MODEL_SOURCE_FILES in cli/django_orm_lens/parser.py.
+ * MODEL_SOURCE_FILES in cli/orm_lens/parser.py.
  */
 const MODEL_SOURCE_FILES = new Set(['models.py', 'abstract_models.py']);
 
@@ -643,7 +861,7 @@ type ImportTarget = { module: string; name: string | null };
 
 /**
  * Map each name a module binds by import to the module (and name) it came
- * from. Mirrors `_parse_imports` in cli/django_orm_lens/parser.py.
+ * from. Mirrors `_parse_imports` in cli/orm_lens/parser.py.
  */
 export function parseImports(content: string): Map<string, ImportTarget> {
   const out = new Map<string, ImportTarget>();
@@ -719,7 +937,7 @@ function moduleFiles(module: string, fromFile: string, root: string): string[] {
  * defining each unknown base — through re-exports and relative imports — and
  * returns those classes so `resolveAndFilter` sees the whole chain. Only
  * classes something inherits from are pulled. Mirrors `_pull_imported_bases`
- * in cli/django_orm_lens/parser.py.
+ * in cli/orm_lens/parser.py.
  */
 export function pullImportedBases(
   allDefs: ParsedModel[],
@@ -877,7 +1095,7 @@ export async function scanWorkspace(
     try {
       allDefs.push(...collectDefs(uri.fsPath, content));
     } catch (err) {
-      console.error(`django-orm-lens: parser error in ${uri.fsPath}`, err);
+      console.error(`orm-lens: parser error in ${uri.fsPath}`, err);
     }
   }
   allDefs.push(

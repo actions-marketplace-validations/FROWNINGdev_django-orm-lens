@@ -28,7 +28,8 @@ REPO_ROOT = CLI_DIR.parent
 PYPROJECT = CLI_DIR / "pyproject.toml"
 SERVER_JSON = CLI_DIR / "server.json"
 SMITHERY_YAML = REPO_ROOT / "smithery.yaml"
-MCP_SERVER_PY = CLI_DIR / "django_orm_lens" / "mcp_server.py"
+MCP_SERVER_PY = CLI_DIR / "orm_lens" / "mcp_server.py"
+COMPAT_PYPROJECT = REPO_ROOT / "compat" / "django-orm-lens" / "pyproject.toml"
 
 # Written-out numerals for the docstring phrase "Exposes <word> read-only
 # tools". Extend if the registry ever grows past fifteen.
@@ -96,7 +97,7 @@ def _registered_tool_count_and_docstring():
     package at import time), fall back to reading the source text.
     """
     try:
-        from django_orm_lens import mcp_server
+        from orm_lens import mcp_server
 
         return len(mcp_server.TOOLS), mcp_server.__doc__ or ""
     except ImportError:
@@ -127,21 +128,20 @@ def test_mcp_tool_count_matches_module_docstring() -> None:
 
 
 def test_mcp_extra_pins_each_api_to_a_python_that_has_it() -> None:
-    """Each mcp major must be bounded, and gated on a Python that can run it.
+    """Every mcp requirement must be bounded and gated to Python 3.10+.
 
     mcp 2.0.0 removed `mcp.server.fastmcp`. While the bootstrap only knew that
     name, a bare `>=1.0` resolved 2.0.0 and every MCP user got "requires the
     'mcp' package" from a package that was installed — which is why this test
-    used to demand a flat `<2` cap.
+    once demanded a flat `<2` cap. `_load_server_class()` now accepts either
+    SDK, so the cap moved up to `<3`: a 3.0 that removes `MCPServer` the way
+    2.0 removed `FastMCP` must fail here, not in a user's terminal.
 
-    `mcp_server._load_server_class()` now accepts either SDK, so the cap moves
-    up rather than away. What replaces it is the constraint that actually
-    binds: mcp 2.0 requires Python >= 3.10 while this package supports 3.9, so
-    the two majors have to be split on an environment marker. Without the
-    marker, pip on 3.9 finds no installable mcp 2.x and fails the whole extra.
-
-    Both ceilings stay closed. A 3.0 that removes `MCPServer` the way 2.0
-    removed `FastMCP` must fail here, not in a user's terminal.
+    The extra used to carry `mcp>=1.0,<2; python_version < '3.10'` for 3.9.
+    That line could never resolve: every mcp release, 1.x included, declares
+    `requires-python >=3.10`, so pip and uv rejected the whole
+    `orm-lens[mcp]` install on 3.9. A requirement the resolver can
+    only fail on is worse than none, so no mcp line may reach below 3.10.
     """
     text = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
         encoding="utf-8"
@@ -152,11 +152,34 @@ def test_mcp_extra_pins_each_api_to_a_python_that_has_it() -> None:
             for row in text.splitlines()
             if row.strip().startswith(f"{extra} = [")
         )
-        assert "mcp>=1.0,<2" in line, f"{extra} must keep a 1.x branch: {line}"
-        assert "mcp>=2.0,<3" in line, f"{extra} must cap 2.x below 3.0: {line}"
-        assert (
-            "python_version < '3.10'" in line
-        ), f"{extra} must gate 1.x to Python 3.9: {line}"
-        assert (
-            "python_version >= '3.10'" in line
-        ), f"{extra} must gate 2.x to Python 3.10+: {line}"
+        reqs = re.findall(r'"([^"]+)"', line)
+        mcp_reqs = [r for r in reqs if re.match(r"mcp\b", r)]
+        assert mcp_reqs, f"{extra} must install the mcp SDK: {line}"
+        for req in mcp_reqs:
+            assert "<3" in req, f"{extra} must cap mcp below 3.0: {req}"
+            assert (
+                "python_version >= '3.10'" in req
+            ), f"{extra}: mcp has no release for Python < 3.10, gate it: {req}"
+            assert (
+                "python_version < '3.10'" not in req
+            ), f"{extra}: this can never resolve, mcp requires 3.10: {req}"
+
+
+def test_compat_package_follows_the_current_orm_lens() -> None:
+    """``pip install django-orm-lens`` must keep installing this orm-lens.
+
+    The compat package is no longer released with orm-lens, so it pins a 1.x
+    range; that range has to admit the version in cli/pyproject.toml.
+    """
+    if not COMPAT_PYPROJECT.is_file():
+        pytest.skip("compat package not present (installed-package run)")
+    version = tuple(int(p) for p in _pyproject_version().split("."))
+    text = COMPAT_PYPROJECT.read_text(encoding="utf-8")
+    specs = re.findall(r'"orm-lens(?:\[mcp\])?([<>=!~][^"]*)"', text)
+    assert len(specs) == 3, f"expected the base pin and two extras, got {specs}"
+    for spec in specs:
+        m = re.fullmatch(r">=(\d+)\.(\d+)\.(\d+),<(\d+)", spec)
+        assert m, f"compat must pin a range like >=1.17.1,<2, not {spec!r}"
+        floor = tuple(int(g) for g in m.groups()[:3])
+        assert floor <= version, f"compat floor {spec} is above orm-lens {version}"
+        assert int(m.group(4)) == version[0] + 1, f"compat {spec} excludes orm-lens {version}"

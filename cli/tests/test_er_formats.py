@@ -16,9 +16,9 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from django_orm_lens.cli import _build_mermaid, main
-from django_orm_lens.er_formats import build_d2, build_dbml, build_dot, build_plantuml
-from django_orm_lens.parser import DEFAULT_EXCLUDES, scan_workspace
+from orm_lens.cli import _build_mermaid, main
+from orm_lens.er_formats import build_d2, build_dbml, build_dot, build_plantuml
+from orm_lens.parser import DEFAULT_EXCLUDES, scan_workspace
 
 FIXTURES = Path(__file__).parent / "fixtures"
 MINIAPP = FIXTURES / "miniapp"
@@ -53,6 +53,11 @@ class MiniappAllFormatsTest(unittest.TestCase):
         self.assertNotIn("C:\\", dbml)
         self.assertIn("orders/models.py", dbml)
 
+    def test_dbml_notes_use_one_based_source_lines(self) -> None:
+        dbml = build_dbml(self.index)
+        self.assertIn("Note: 'line 4 of orders/models.py'", dbml)
+        self.assertIn("Note: 'line 13 of orders/models.py'", dbml)
+
     def test_d2_sql_tables_and_edges(self) -> None:
         d2 = build_d2(self.index)
         self.assertIn("orders.Order: {", d2)
@@ -69,7 +74,7 @@ class MiniappAllFormatsTest(unittest.TestCase):
 
     def test_dot_clusters_tables_and_edges(self) -> None:
         dot = build_dot(self.index)
-        self.assertTrue(dot.startswith("digraph django_orm_lens {"))
+        self.assertTrue(dot.startswith("digraph orm_lens {"))
         self.assertIn('subgraph "cluster_orders" {', dot)
         self.assertIn('"orders.Order" [label=<<TABLE', dot)
         self.assertIn(
@@ -159,6 +164,32 @@ class SyntheticSchemaTest(unittest.TestCase):
         d2 = build_d2(idx)
         self.assertIn("through Tagging", d2)
 
+    def test_dbml_maps_django_61_db_level_on_delete(self) -> None:
+        idx = self._index_for(
+            "from django.db import models\n"
+            "class Post(models.Model):\n"
+            "    pass\n"
+            "class Comment(models.Model):\n"
+            "    post = models.ForeignKey(Post, on_delete=models.DB_CASCADE)\n"
+            "    reply_to = models.ForeignKey(\n"
+            "        'self', null=True, on_delete=models.DB_SET_NULL)\n"
+            "    pinned_on = models.ForeignKey(\n"
+            "        Post, default=1, on_delete=models.DB_SET_DEFAULT,\n"
+            "        related_name='pins')\n"
+        )
+        dbml = build_dbml(idx)
+        self.assertIn(
+            "Ref: blog.Comment.post > blog.Post.id [delete: cascade]", dbml
+        )
+        self.assertIn(
+            "Ref: blog.Comment.reply_to > blog.Comment.id [delete: set null]",
+            dbml,
+        )
+        self.assertIn(
+            "Ref: blog.Comment.pinned_on > blog.Post.id [delete: set default]",
+            dbml,
+        )
+
     def test_auth_user_model_resolves_like_mermaid(self) -> None:
         idx = self._index_for(
             "from django.conf import settings\n"
@@ -226,6 +257,102 @@ class SyntheticSchemaTest(unittest.TestCase):
         self.assertIn("product → sku / ForeignKey / PROTECT", dot)
 
 
+class MermaidSameNameModelsTest(unittest.TestCase):
+    """Two apps defining the same class name stay two Mermaid entities (#223)."""
+
+    def _index_for(self, apps: dict[str, str]):
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        for label, models_py in apps.items():
+            app = Path(tmp.name) / label
+            app.mkdir()
+            (app / "__init__.py").write_text("", encoding="utf-8")
+            (app / "models.py").write_text(models_py, encoding="utf-8")
+        return scan_workspace(tmp.name, DEFAULT_EXCLUDES)
+
+    def test_colliding_names_get_their_app_prefix(self) -> None:
+        idx = self._index_for(
+            {
+                "basket": (
+                    "from django.db import models\n"
+                    "class Basket(models.Model):\n"
+                    "    owner = models.CharField(max_length=50)\n"
+                    "class Line(models.Model):\n"
+                    "    basket = models.ForeignKey(Basket, on_delete=models.CASCADE)\n"
+                    "    quantity = models.IntegerField()\n"
+                ),
+                "order": (
+                    "from django.db import models\n"
+                    "class Order(models.Model):\n"
+                    "    number = models.CharField(max_length=20)\n"
+                    "class Line(models.Model):\n"
+                    "    order = models.ForeignKey(Order, on_delete=models.CASCADE)\n"
+                    "    title = models.CharField(max_length=100)\n"
+                ),
+            }
+        )
+        mermaid = _build_mermaid(idx).splitlines()
+        self.assertIn("  basket_Line {", mermaid)
+        self.assertIn("  order_Line {", mermaid)
+        self.assertNotIn("  Line {", mermaid)
+        # Names that are unique stay bare.
+        self.assertIn("  Basket {", mermaid)
+        self.assertIn("  Order {", mermaid)
+        self.assertIn('  basket_Line }o--|| Basket : "basket [CASCADE]"', mermaid)
+        self.assertIn('  order_Line }o--|| Order : "order [CASCADE]"', mermaid)
+        # Each entity keeps only its own columns.
+        body = "\n".join(mermaid)
+        self.assertIn("basket_Line {\n    IntegerField quantity\n  }", body)
+        self.assertIn("order_Line {\n    CharField title\n  }", body)
+
+    def test_edges_to_a_colliding_name_pick_the_right_app(self) -> None:
+        idx = self._index_for(
+            {
+                "basket": (
+                    "from django.db import models\n"
+                    "class Line(models.Model):\n"
+                    "    quantity = models.IntegerField()\n"
+                    "class LineAttribute(models.Model):\n"
+                    "    line = models.ForeignKey(Line, on_delete=models.CASCADE)\n"
+                ),
+                "order": (
+                    "from django.db import models\n"
+                    "class Line(models.Model):\n"
+                    "    title = models.CharField(max_length=100)\n"
+                    "    parent = models.ForeignKey('self', on_delete=models.CASCADE)\n"
+                ),
+                "refund": (
+                    "from django.db import models\n"
+                    "class Refund(models.Model):\n"
+                    "    line = models.ForeignKey('order.Line', on_delete=models.PROTECT)\n"
+                ),
+            }
+        )
+        mermaid = _build_mermaid(idx).splitlines()
+        # Same app as the field wins for a bare name.
+        self.assertIn(
+            '  LineAttribute }o--|| basket_Line : "line [CASCADE]"', mermaid
+        )
+        # 'self' points at the model's own entity.
+        self.assertIn(
+            '  order_Line }o--|| order_Line : "parent [CASCADE]"', mermaid
+        )
+        # An app-qualified reference keeps its app.
+        self.assertIn('  Refund }o--|| order_Line : "line [PROTECT]"', mermaid)
+
+    def test_unique_names_are_unchanged(self) -> None:
+        """Projects without duplicate class names get bare entity names."""
+        index = scan_workspace(str(FIXTURES / "golden" / "saleor"), DEFAULT_EXCLUDES)
+        names = [m.name for app in index.apps for m in app.models]
+        self.assertEqual(len(names), len(set(names)))
+        entities = [
+            line[2:-2]
+            for line in _build_mermaid(index).splitlines()
+            if line.startswith("  ") and line.endswith(" {")
+        ]
+        self.assertEqual(entities, names)
+
+
 class CliWiringTest(unittest.TestCase):
     def test_er_format_flags(self) -> None:
         for fmt, marker in (
@@ -233,7 +360,7 @@ class CliWiringTest(unittest.TestCase):
             ("dbml", "Table orders.Order {"),
             ("d2", "shape: sql_table"),
             ("plantuml", "@startuml"),
-            ("dot", "digraph django_orm_lens"),
+            ("dot", "digraph orm_lens"),
         ):
             code, out, _ = _run(["er", "--path", str(MINIAPP), "--format", fmt])
             self.assertEqual(code, 0, f"{fmt} exited {code}")

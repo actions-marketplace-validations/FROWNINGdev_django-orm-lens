@@ -1,4 +1,4 @@
-"""Tests for the blast-radius composer (cli/django_orm_lens/blast_radius.py).
+"""Tests for the blast-radius composer (cli/orm_lens/blast_radius.py).
 
 Runs against tests/fixtures/blast_radius — a two-migration app whose second
 migration drops a field that models.py, views.py, serializers.py and a
@@ -15,16 +15,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from django_orm_lens.blast_radius import (
+from orm_lens.blast_radius import (
     COMMENT_MARKER,
     DESTRUCTIVE_OPERATIONS,
     analyze_blast_radius,
     format_markdown,
     format_text,
 )
-from django_orm_lens.ci_formats import blast_radius_github
-from django_orm_lens.impact import layer_of
-from django_orm_lens.parser import scan_workspace
+from orm_lens.ci_formats import blast_radius_github
+from orm_lens.impact import layer_of
+from orm_lens.mcp_server import _tool_blast_radius
+from orm_lens.parser import scan_workspace
 
 FIXTURE = Path(__file__).parent / "fixtures" / "blast_radius"
 
@@ -116,7 +117,7 @@ class RenderingTest(unittest.TestCase):
 
     def test_markdown_is_a_postable_pr_comment(self) -> None:
         out = format_markdown(self.report, FIXTURE)
-        self.assertIn("### Django ORM Lens — blast radius", out)
+        self.assertIn("### ORM Lens — blast radius", out)
         self.assertIn("<details>", out)
         self.assertIn("| Layer | Confidence | Location | Code |", out)
 
@@ -204,6 +205,72 @@ class RenameBlastRadiusTest(unittest.TestCase):
         self.assertEqual(len(report.targets), 1)
         lines = [f.snippet for f in report.targets[0].impact]
         self.assertTrue(any("Product.objects" in line for line in lines), lines)
+
+
+class RemovedFieldBlastRadiusTest(unittest.TestCase):
+    """Regression (#140): after ``makemigrations`` the dropped field is
+    already gone from models.py, which is exactly when code still reading it
+    breaks. That RemoveField must still become a target."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        app = self.root / "shop"
+        (app / "migrations").mkdir(parents=True)
+        (app / "migrations" / "__init__.py").write_text("")
+        (app / "models.py").write_text(
+            "from django.db import models\n\n\n"
+            "class Product(models.Model):\n"
+            "    name = models.CharField(max_length=100)\n"
+        )
+        (app / "migrations" / "0001_initial.py").write_text(
+            "from django.db import migrations\n\n\n"
+            "class Migration(migrations.Migration):\n"
+            "    initial = True\n"
+            "    operations = []\n"
+        )
+        (app / "migrations" / "0002_remove_legacy.py").write_text(
+            "from django.db import migrations\n\n\n"
+            "class Migration(migrations.Migration):\n"
+            '    dependencies = [("shop", "0001_initial")]\n'
+            "    operations = [\n"
+            '        migrations.RemoveField(model_name="product", name="legacy_code"),\n'
+            "    ]\n"
+        )
+        (app / "legacy_views.py").write_text(
+            "from shop.models import Product\n\n\n"
+            "def legacy(request):\n"
+            '    return Product.objects.filter(legacy_code="x")\n'
+        )
+
+    def test_field_already_gone_from_models_is_a_target(self) -> None:
+        report = analyze_blast_radius(self.root)
+        self.assertEqual(len(report.targets), 1)
+        target = report.targets[0]
+        self.assertEqual(target.label, "shop.product.legacy_code")
+        self.assertEqual(target.worst_severity, "info")
+        self.assertEqual([r.rule for r in target.risks], ["remove_field"])
+        files = {Path(f.file_path).name for f in target.impact}
+        self.assertIn("legacy_views.py", files)
+
+    def test_mcp_tool_reports_it_at_info_severity(self) -> None:
+        out = json.loads(
+            _tool_blast_radius({"workspace_root": str(self.root), "severity": "info"})
+        )
+        self.assertEqual(
+            [t["target"] for t in out["targets"]], ["shop.product.legacy_code"]
+        )
+
+    def test_mcp_tool_default_severity_still_hides_info(self) -> None:
+        out = json.loads(_tool_blast_radius({"workspace_root": str(self.root)}))
+        self.assertEqual(out["targets"], [])
+
+    def test_mcp_tool_all_includes_info(self) -> None:
+        out = json.loads(
+            _tool_blast_radius({"workspace_root": str(self.root), "severity": "all"})
+        )
+        self.assertEqual(len(out["targets"]), 1)
 
 
 class LayerOfTest(unittest.TestCase):

@@ -63,7 +63,7 @@ async function doScan(): Promise<void> {
     const total = currentIndex.apps.reduce((n, a) => n + a.models.length, 0);
     const took = Date.now() - before;
     statusItem.text = `$(database) ${total} model${total === 1 ? '' : 's'}`;
-    statusItem.tooltip = `Django ORM Lens — scanned in ${took}ms`;
+    statusItem.tooltip = `ORM Lens — scanned in ${took}ms`;
     statusItem.show();
     // Signal viewsWelcome: the initial scan has completed. From now on the
     // "empty state" reads "no Django models found" instead of "scanning…".
@@ -76,8 +76,8 @@ async function doScan(): Promise<void> {
     outputChannel.appendLine(
       `[scan #${myGen}] ${err instanceof Error ? err.stack ?? err.message : String(err)}`
     );
-    statusItem.text = '$(warning) Django ORM Lens';
-    statusItem.tooltip = 'Scan failed — see the Django ORM Lens output channel';
+    statusItem.text = '$(warning) ORM Lens';
+    statusItem.tooltip = 'Scan failed — see the ORM Lens output channel';
     statusItem.show();
   }
 }
@@ -133,7 +133,7 @@ function setupWatcher(context: vscode.ExtensionContext) {
 
 export async function activate(context: vscode.ExtensionContext) {
   treeProvider = new DjangoTreeProvider(context.workspaceState);
-  outputChannel = vscode.window.createOutputChannel('Django ORM Lens');
+  outputChannel = vscode.window.createOutputChannel('ORM Lens');
   context.subscriptions.push(outputChannel);
   statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusItem.command = 'djangoOrmLens.showGraph';
@@ -193,7 +193,7 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Activity-bar badge: passive count of Django ORM Lens findings.
+  // Activity-bar badge: passive count of ORM Lens findings.
   // GitHub PRs / Docker style — user glances at the icon and knows what's
   // outstanding without opening the view. Dot when unknown, number when > 0.
   const updateBadge = () => {
@@ -207,7 +207,7 @@ export async function activate(context: vscode.ExtensionContext) {
       ? undefined
       : {
           value: n,
-          tooltip: `${n} Django ORM Lens issue${n === 1 ? '' : 's'}`,
+          tooltip: `${n} ORM Lens issue${n === 1 ? '' : 's'}`,
         };
   };
   updateBadge();
@@ -333,7 +333,7 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('djangoOrmLens.refresh', async () => {
       await refresh();
-      vscode.window.setStatusBarMessage('$(check) Django ORM Lens refreshed', 2000);
+      vscode.window.setStatusBarMessage('$(check) ORM Lens refreshed', 2000);
     })
   );
 
@@ -409,7 +409,7 @@ export async function activate(context: vscode.ExtensionContext) {
             ])
           );
           const chosen = await vscode.window.showQuickPick(picks, {
-            title: 'Django ORM Lens — Query Builder',
+            title: 'ORM Lens — Query Builder',
             placeHolder: 'Pick a target field or model',
           });
           if (!chosen) return;
@@ -419,7 +419,7 @@ export async function activate(context: vscode.ExtensionContext) {
         const templates = generateQueryTemplates(target, currentIndex);
         if (templates.length === 0) {
           vscode.window.showInformationMessage(
-            'Django ORM Lens: no templates apply to this target.',
+            'ORM Lens: no templates apply to this target.',
           );
           return;
         }
@@ -442,13 +442,14 @@ export async function activate(context: vscode.ExtensionContext) {
         const snippetString = new vscode.SnippetString(chosen.template.snippet);
         if (editor && editor.document.languageId === 'python') {
           await editor.insertSnippet(snippetString);
+          void maybeAskForStar(context);
           return;
         }
         // No active Python editor — open a fresh untitled buffer.
         const modelName =
           target.kind === 'model' ? target.modelName : target.modelName;
         const boiler = [
-          `# Django ORM Lens — Query Builder scratch`,
+          `# ORM Lens — Query Builder scratch`,
           `# from ${
             currentIndex.apps.find((a) =>
               a.models.some((m) => m.name === modelName),
@@ -465,6 +466,7 @@ export async function activate(context: vscode.ExtensionContext) {
           preview: false,
         });
         await openedEditor.insertSnippet(snippetString);
+        void maybeAskForStar(context);
       },
     ),
   );
@@ -507,7 +509,7 @@ export async function activate(context: vscode.ExtensionContext) {
             ])
           );
           const chosen = await vscode.window.showQuickPick(picks, {
-            title: 'Django ORM Lens — Impact Analysis',
+            title: 'ORM Lens — Impact Analysis',
             placeHolder: 'Pick a field or model to trace',
           });
           if (!chosen) return;
@@ -518,14 +520,14 @@ export async function activate(context: vscode.ExtensionContext) {
         await vscode.window.withProgress(
           {
             location: vscode.ProgressLocation.Notification,
-            title: `Django ORM Lens: scanning references to '${needle}'…`,
+            title: `ORM Lens: scanning references to '${needle}'…`,
             cancellable: true,
           },
           async (_progress, token) => {
             const findings = await scanImpact(needle!, { skipFiles, token });
             if (findings.length === 0) {
               vscode.window.showInformationMessage(
-                `Django ORM Lens: no references to '${needle}' found across the workspace.`,
+                `ORM Lens: no references to '${needle}' found across the workspace.`,
               );
               return;
             }
@@ -558,6 +560,7 @@ export async function activate(context: vscode.ExtensionContext) {
               new vscode.Range(pos, pos),
               vscode.TextEditorRevealType.InCenter,
             );
+            void maybeAskForStar(context);
           },
         );
       },
@@ -582,7 +585,7 @@ export async function activate(context: vscode.ExtensionContext) {
       ];
       if (modelsFiles.length === 0) {
         vscode.window.showInformationMessage(
-          'Django ORM Lens: no models.py found — scan a Django project first.',
+          'ORM Lens: no models.py found — scan a Django project first.',
         );
         return;
       }
@@ -590,7 +593,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (modelsFiles.length > 1) {
         const pick = await vscode.window.showQuickPick(
           modelsFiles.map((p) => ({ label: p, description: 'models.py' })),
-          { title: 'Django ORM Lens — schema diff', placeHolder: 'Pick a models.py' },
+          { title: 'ORM Lens — schema diff', placeHolder: 'Pick a models.py' },
         );
         if (!pick) return;
         target = pick.label;
@@ -598,7 +601,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const wsFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(target));
       if (!wsFolder) {
         vscode.window.showWarningMessage(
-          'Django ORM Lens: file is outside the current workspace.',
+          'ORM Lens: file is outside the current workspace.',
         );
         return;
       }
@@ -609,7 +612,7 @@ export async function activate(context: vscode.ExtensionContext) {
         commits = await gitLogFollow(cwd, target, 200);
       } catch (err) {
         vscode.window.showWarningMessage(
-          `Django ORM Lens: git log failed — is this a git repo? (${
+          `ORM Lens: git log failed — is this a git repo? (${
             err instanceof Error ? err.message : String(err)
           })`,
         );
@@ -617,7 +620,7 @@ export async function activate(context: vscode.ExtensionContext) {
       }
       if (commits.length < 2) {
         vscode.window.showInformationMessage(
-          'Django ORM Lens: need at least 2 commits touching this file for a diff.',
+          'ORM Lens: need at least 2 commits touching this file for a diff.',
         );
         return;
       }
@@ -657,7 +660,7 @@ export async function activate(context: vscode.ExtensionContext) {
         ]);
       } catch (err) {
         vscode.window.showWarningMessage(
-          `Django ORM Lens: could not read historical models.py (${
+          `ORM Lens: could not read historical models.py (${
             err instanceof Error ? err.message : String(err)
           })`,
         );
@@ -666,7 +669,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
       const events = diffSchemas(oldModels, newModels);
       const header = [
-        `# Django ORM Lens — Schema Diff`,
+        `# ORM Lens — Schema Diff`,
         '',
         `**From:** \`${fromPick.sha.slice(0, 8)}\` — ${new Date(
           commits.find((c) => c.sha === fromPick.sha)!.ct * 1000,
@@ -685,6 +688,7 @@ export async function activate(context: vscode.ExtensionContext) {
         language: 'markdown',
       });
       await vscode.window.showTextDocument(doc, { preview: false });
+      void maybeAskForStar(context);
     }),
   );
 
@@ -737,7 +741,7 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         if (!model) {
           vscode.window.showInformationMessage(
-            'Django ORM Lens: no model matched — try Refresh and retry.'
+            'ORM Lens: no model matched — try Refresh and retry.'
           );
           return;
         }
@@ -747,6 +751,7 @@ export async function activate(context: vscode.ExtensionContext) {
           language: 'python',
         });
         await vscode.window.showTextDocument(doc, { preview: false });
+        void maybeAskForStar(context);
       }
     )
   );
@@ -774,7 +779,7 @@ export async function activate(context: vscode.ExtensionContext) {
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           vscode.window.showWarningMessage(
-            `Django ORM Lens: could not open ${filePath}. It may have been moved, deleted, or is outside the workspace. (${msg})`
+            `ORM Lens: could not open ${filePath}. It may have been moved, deleted, or is outside the workspace. (${msg})`
           );
           refresh().catch((refreshErr) =>
             outputChannel.appendLine(
@@ -792,7 +797,7 @@ export async function activate(context: vscode.ExtensionContext) {
       async (node?: TreeNode) => {
         if (!node || node.kind !== 'model') {
           vscode.window.showInformationMessage(
-            'Django ORM Lens: right-click a model in the sidebar to find reverse references.'
+            'ORM Lens: right-click a model in the sidebar to find reverse references.'
           );
           return;
         }
@@ -842,6 +847,7 @@ export async function activate(context: vscode.ExtensionContext) {
           title: `Reverse references to ${modelName} (${inbound.length})`,
           placeHolder: 'Models that point at this one',
         });
+        void maybeAskForStar(context);
       }
     )
   );

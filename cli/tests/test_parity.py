@@ -12,7 +12,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from django_orm_lens.parser import _extract_on_delete, parse_models_file
+from orm_lens.parser import _extract_on_delete, parse_models_file
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = REPO_ROOT / "test" / "fixtures" / "parity_input.py"
@@ -51,10 +51,28 @@ class ParityFixtureTest(unittest.TestCase):
             self.assertEqual(m.app_name, "fixtures", f"{m.name}: app_name derived from parent dir")
 
         author = models[0]
-        self.assertEqual(len(author.fields), 1)
-        self.assertEqual(author.fields[0].name, "name")
-        self.assertEqual(author.fields[0].type, "CharField")
-        self.assertFalse(author.fields[0].is_relation)
+        self.assertEqual(
+            [(f.name, f.type) for f in author.fields],
+            [
+                ("name", "CharField"),
+                ("aliases", "ArrayField"),
+                ("tags", "ArrayField"),
+                ("punctuation", "CharField"),
+                ("blurb", "TextField"),
+                ("attributes", "HStoreField"),
+                ("years_active", "IntegerRangeField"),
+                ("search_document", "SearchVectorField"),
+                ("normalized_name", "GeneratedField"),
+            ],
+        )
+        self.assertTrue(all(not f.is_relation for f in author.fields))
+        self.assertEqual(
+            author.fields[1].args, "ArrayField(models.TextField(), size=2)"
+        )
+
+        self.assertEqual(author.fields[2].args, 'models.CharField(max_length=10, default="(")')
+        self.assertEqual(author.fields[3].args, r"max_length=10, default='it\'s )'")
+        self.assertEqual(author.fields[4].args, 'default="""first (\nsecond (\n"""')
 
         book = models[1]
         self.assertEqual(len(book.fields), 4, "title + author + editor + tags")
@@ -110,18 +128,18 @@ class ParserGuardsTest(unittest.TestCase):
 
     def test_read_balanced_args_no_open_paren_returns_empty(self) -> None:
         """A field-shaped line without ( must not raise ValueError."""
-        from django_orm_lens.parser import _read_balanced_args
+        from orm_lens.parser import _read_balanced_args
         self.assertEqual(_read_balanced_args(["    name = CharField"], 0), ("", 0))
 
     def test_detect_class_indent_clamps_at_32(self) -> None:
         """A crafted deep-indent input must not exceed the ReDoS clamp."""
-        from django_orm_lens.parser import _detect_class_indent
+        from orm_lens.parser import _detect_class_indent
         deep = " " * 200 + "x = 1"
         self.assertEqual(_detect_class_indent(["class Foo(Model):", deep], 0), 32)
 
     def test_detect_class_indent_expands_tabs_to_four(self) -> None:
         """A tab-indented body reports width 4, not raw byte length 1."""
-        from django_orm_lens.parser import _detect_class_indent
+        from orm_lens.parser import _detect_class_indent
         self.assertEqual(_detect_class_indent(["class Foo(Model):", "	x = 1"], 0), 4)
 
 

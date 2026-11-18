@@ -20,22 +20,39 @@ jobs:
       - name: Run tests
         run: npm test
       - name: Package VSIX
-        run: npx --yes @vscode/vsce package --out django-orm-lens.vsix
+        run: npx --yes @vscode/vsce package --out orm-lens.vsix
       - uses: actions/upload-artifact@v7
         with:
           name: vsix
-          path: django-orm-lens.vsix
+          path: orm-lens.vsix
 
   python-cli:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Explicit pairs instead of a cross product. The Python axis is the one
+      # that matters: the parser is built on `ast`, which changes between
+      # releases, so every Python in `requires-python` runs, 3.9 through 3.15.
+      # The tests never import Django, so the Django axis only checks that the
+      # CLI installs next to each supported release. Each pair is one Django
+      # supports: 4.2 stops at 3.12, 6.x starts at 3.12, and 3.15 pairs with
+      # 6.1, the first release line to support it. 5.0 and 5.1 are past end of
+      # life and were dropped from the matrix.
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
-        django-version: ["4.2", "5.0", "5.1", "5.2"]
-        exclude:
-          - python-version: "3.10"
-            django-version: "5.2"
+        include:
+          - { python-version: "3.9", django-version: "4.2" }
+          - { python-version: "3.10", django-version: "4.2" }
+          - { python-version: "3.11", django-version: "4.2" }
+          - { python-version: "3.11", django-version: "5.2" }
+          - { python-version: "3.12", django-version: "4.2" }
+          - { python-version: "3.12", django-version: "5.2" }
+          - { python-version: "3.12", django-version: "6.0" }
+          - { python-version: "3.13", django-version: "5.2" }
+          - { python-version: "3.13", django-version: "6.0" }
+          - { python-version: "3.13", django-version: "6.1" }
+          - { python-version: "3.14", django-version: "5.2" }
+          - { python-version: "3.14", django-version: "6.1" }
+          - { python-version: "3.15", django-version: "6.1" }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -60,6 +77,19 @@ jobs:
         if: matrix.python-version == '3.12' && matrix.django-version == '5.2'
         working-directory: cli
         run: pip install -e ".[mcp]"
+      # No mcp release supports 3.9, so the extra resolves nothing there. It
+      # must still install, CLI and all, and the server must explain the
+      # floor (exit 3) instead of the resolver rejecting the whole install.
+      - name: The mcp extra still installs on 3.9
+        if: matrix.python-version == '3.9'
+        working-directory: cli
+        run: |
+          pip install -e ".[mcp]"
+          set +e
+          orm-lens-mcp
+          code=$?
+          set -e
+          test "$code" -eq 3
       - name: Run pytest
         working-directory: cli
         run: python -m pytest -q
@@ -76,7 +106,15 @@ jobs:
         run: pip install -e ".[dev]"
       - name: ruff
         working-directory: cli
-        run: python -m ruff check django_orm_lens tests
+        run: python -m ruff check orm_lens tests ../compat/django-orm-lens/django_orm_lens ../compat/django-orm-lens/django_orm_lens_cli.py
       - name: mypy
         working-directory: cli
-        run: python -m mypy django_orm_lens
+        run: python -m mypy orm_lens ../compat/django-orm-lens/django_orm_lens ../compat/django-orm-lens/django_orm_lens_cli.py
+      # The django-orm-lens compat package is uploaded by hand, rarely; a
+      # compat package that no longer builds would only show up on that day
+      # otherwise.
+      - name: Build both distributions
+        run: |
+          python -m build cli --outdir dist
+          python -m build compat/django-orm-lens --outdir dist
+          python -m twine check dist/*

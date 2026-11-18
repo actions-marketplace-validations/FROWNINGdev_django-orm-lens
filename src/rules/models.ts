@@ -12,14 +12,18 @@ import { Finding, Rule, RuleContext } from './types';
  */
 
 const DOCS_BASE =
-  'https://github.com/FROWNINGdev/django-orm-lens/blob/main/docs/rules';
+  'https://github.com/FROWNINGdev/orm-lens/blob/main/docs/rules';
 
 /** `models.CharField(...)` or `models.TextField(...)` — string-based fields. */
-const RE_STRING_FIELD_LINE =
-  /\b(?:models\.)?(CharField|TextField)\s*\(([^()]*)\)/g;
-/** ForeignKey call opener — used to detect missing on_delete on the same line. */
-const RE_FOREIGN_KEY_LINE =
-  /\b(?:models\.)?ForeignKey\s*\(([^()]*)\)/g;
+const RE_STRING_FIELD_OPEN =
+  /\b(?:models\.)?(CharField|TextField)\s*\(/g;
+/**
+ * ForeignKey / OneToOneField call opener: the relations that require on_delete.
+ * The argument list is read by `readCallArgs`, so nested calls such as
+ * `verbose_name=_("author")` don't hide the call.
+ */
+const RE_ON_DELETE_FIELD_OPEN =
+  /\b(?:models\.)?(ForeignKey|OneToOneField)\s*\(/g;
 /** class Foo(models.Model): or class Foo(SomethingWithModel): */
 const RE_CLASS_HEAD =
   /^(\s*)class\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*:/;
@@ -34,6 +38,73 @@ function hasKwarg(argBody: string, kw: string): boolean {
 function hasKwargName(argBody: string, kw: string): boolean {
   const re = new RegExp(`\\b${kw}\\s*=`);
   return re.test(argBody);
+}
+
+/**
+ * Read a call's argument list, starting just after its opening `(`, up to
+ * the matching `)` on the same line. Quotes and nested brackets are
+ * respected. Returns the text between the parentheses and the column just
+ * past the closing `)`, or null when the call doesn't close on this line.
+ */
+function readCallArgs(
+  text: string,
+  start: number,
+): { argBody: string; end: number } | null {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === '\\') i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '[' || ch === '{' || ch === '(') depth++;
+    else if (ch === ']' || ch === '}' || ch === ')') {
+      if (depth === 0) {
+        return ch === ')' ? { argBody: text.slice(start, i), end: i + 1 } : null;
+      }
+      depth--;
+    }
+  }
+  return null;
+}
+
+/**
+ * Number of positional arguments before the first keyword, splitting on
+ * top-level commas only (quotes and brackets respected).
+ */
+function positionalArgCount(argBody: string): number {
+  const parts: string[] = [];
+  let depth = 0;
+  let quote: string | null = null;
+  let cur = '';
+  for (let i = 0; i < argBody.length; i++) {
+    const ch = argBody[i];
+    if (quote) {
+      cur += ch;
+      if (ch === '\\') cur += argBody[++i] ?? '';
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '[' || ch === '{' || ch === '(') depth++;
+    else if (ch === ']' || ch === '}' || ch === ')') depth--;
+    else if (ch === ',' && depth === 0) {
+      parts.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) parts.push(cur);
+  let count = 0;
+  for (const part of parts) {
+    if (/^\s*[A-Za-z_]\w*\s*=(?!=)/.test(part) || /^\s*\*/.test(part)) break;
+    if (part.trim()) count++;
+  }
+  return count;
 }
 
 /** Skip lines whose leading non-space char is `#`. */
@@ -96,16 +167,20 @@ const DOL011: Rule = {
     for (let i = 0; i < ctx.lineCount; i++) {
       const text = ctx.lineAt(i);
       if (isCommentLine(text)) continue;
-      RE_STRING_FIELD_LINE.lastIndex = 0;
+      RE_STRING_FIELD_OPEN.lastIndex = 0;
       let m: RegExpExecArray | null;
-      while ((m = RE_STRING_FIELD_LINE.exec(text)) !== null) {
-        const argBody = m[2];
-        if (!hasKwarg(argBody, 'null')) continue;
+      while ((m = RE_STRING_FIELD_OPEN.exec(text)) !== null) {
+        // `readCallArgs`, not `([^()]*)`: an i18n wrapper such as
+        // `verbose_name=_("Name")` contains its own parens, and the flat
+        // regex never matched the field at all (#182 for DOL013).
+        const call = readCallArgs(text, m.index + m[0].length);
+        if (call === null) continue;
+        if (!hasKwarg(call.argBody, 'null')) continue;
         out.push({
           code: 'DOL011',
           messageId: 'default',
           args: { field: m[1] },
-          range: { line: i, startCol: m.index, endCol: m.index + m[0].length },
+          range: { line: i, startCol: m.index, endCol: call.end },
           applicability: 'suggestion',
         });
       }
@@ -171,10 +246,10 @@ const DOL012: Rule = {
 };
 
 /**
- * DOL013 — ForeignKey / OneToOneField / ManyToManyField called without an
- * explicit `on_delete=`. Django dropped the default in 2.0 — omitting it
- * on FK/1to1 is a hard TypeError, but on models still-being-written it's
- * easy to miss. Detect at author-time.
+ * DOL013 — ForeignKey / OneToOneField called without an explicit
+ * `on_delete=`. Django dropped the default in 2.0 — omitting it is a hard
+ * TypeError, but on models still-being-written it's easy to miss. Detect at
+ * author-time. ManyToManyField has no on_delete and is left alone.
  *
  * Applicability: suggestion (we insert `on_delete=models.CASCADE` as a
  * template — user must decide the real behaviour).
@@ -182,14 +257,14 @@ const DOL012: Rule = {
 const DOL013: Rule = {
   meta: {
     code: 'DOL013',
-    title: 'ForeignKey without on_delete',
+    title: 'ForeignKey or OneToOneField without on_delete',
     category: 'correctness',
     defaultSeverity: 'error',
     docsUrl: `${DOCS_BASE}/DOL013.md`,
     since: '0.8.0',
     messages: {
       default:
-        'ForeignKey requires on_delete — this raises TypeError at model-load time. Add on_delete=models.CASCADE (or PROTECT/SET_NULL/SET_DEFAULT/DO_NOTHING).',
+        '{field} requires on_delete — this raises TypeError at model-load time. Add on_delete=models.CASCADE (or PROTECT/SET_NULL/SET_DEFAULT/DO_NOTHING).',
     },
   },
   check(ctx: RuleContext): Finding[] {
@@ -197,15 +272,23 @@ const DOL013: Rule = {
     for (let i = 0; i < ctx.lineCount; i++) {
       const text = ctx.lineAt(i);
       if (isCommentLine(text)) continue;
-      RE_FOREIGN_KEY_LINE.lastIndex = 0;
+      RE_ON_DELETE_FIELD_OPEN.lastIndex = 0;
       let m: RegExpExecArray | null;
-      while ((m = RE_FOREIGN_KEY_LINE.exec(text)) !== null) {
-        const argBody = m[1];
+      while ((m = RE_ON_DELETE_FIELD_OPEN.exec(text)) !== null) {
+        const call = readCallArgs(text, m.index + m[0].length);
+        if (call === null) continue;
+        const argBody = call.argBody;
         if (hasKwargName(argBody, 'on_delete')) continue;
+        // ForeignKey(to, on_delete, ...): a second positional argument is
+        // on_delete (OneToOneField has the same signature). Django's own
+        // contrib apps write it that way, and the fixer would add a
+        // duplicate on_delete= that really does raise.
+        if (positionalArgCount(argBody) >= 2) continue;
         out.push({
           code: 'DOL013',
           messageId: 'default',
-          range: { line: i, startCol: m.index, endCol: m.index + m[0].length },
+          args: { field: m[1] },
+          range: { line: i, startCol: m.index, endCol: call.end },
           applicability: 'suggestion',
         });
       }
@@ -233,19 +316,20 @@ const DOL014: Rule = {
   },
   check(ctx: RuleContext): Finding[] {
     const out: Finding[] = [];
-    const RE = /\b(?:models\.)?CharField\s*\(([^()]*)\)/g;
+    const RE = /\b(?:models\.)?CharField\s*\(/g;
     for (let i = 0; i < ctx.lineCount; i++) {
       const text = ctx.lineAt(i);
       if (isCommentLine(text)) continue;
       RE.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = RE.exec(text)) !== null) {
-        const argBody = m[1];
-        if (hasKwargName(argBody, 'max_length')) continue;
+        const call = readCallArgs(text, m.index + m[0].length);
+        if (call === null) continue;
+        if (hasKwargName(call.argBody, 'max_length')) continue;
         out.push({
           code: 'DOL014',
           messageId: 'default',
-          range: { line: i, startCol: m.index, endCol: m.index + m[0].length },
+          range: { line: i, startCol: m.index, endCol: call.end },
           applicability: 'suggestion',
         });
       }
@@ -275,19 +359,20 @@ const DOL015: Rule = {
   },
   check(ctx: RuleContext): Finding[] {
     const out: Finding[] = [];
-    const RE = /\b(?:models\.)?TextField\s*\(([^()]*)\)/g;
+    const RE = /\b(?:models\.)?TextField\s*\(/g;
     for (let i = 0; i < ctx.lineCount; i++) {
       const text = ctx.lineAt(i);
       if (isCommentLine(text)) continue;
       RE.lastIndex = 0;
       let m: RegExpExecArray | null;
       while ((m = RE.exec(text)) !== null) {
-        const argBody = m[1];
-        if (!hasKwargName(argBody, 'max_length')) continue;
+        const call = readCallArgs(text, m.index + m[0].length);
+        if (call === null) continue;
+        if (!hasKwargName(call.argBody, 'max_length')) continue;
         out.push({
           code: 'DOL015',
           messageId: 'default',
-          range: { line: i, startCol: m.index, endCol: m.index + m[0].length },
+          range: { line: i, startCol: m.index, endCol: call.end },
           applicability: 'suggestion',
         });
       }

@@ -1,4 +1,4 @@
-"""Integration tests for :mod:`django_orm_lens.mcp_server`.
+"""Integration tests for :mod:`orm_lens.mcp_server`.
 
 These validate the contract that FastMCP will expose to AI agents:
 
@@ -22,6 +22,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 try:  # the ``mcp`` extra is optional — the base install must stay zero-dep
@@ -43,13 +44,15 @@ except ImportError:
         # Binding it once here keeps the name defined on all three paths.
         FastMCP = None  # type: ignore[assignment, misc]
 
-from django_orm_lens import __version__
-from django_orm_lens.mcp_server import (
+from orm_lens import __version__
+from orm_lens.mcp_server import (
     TOOLS,
     _advertise_our_version,
     _load_server_class,
     _lowlevel_handle,
+    _missing_sdk_message,
     _resolve,
+    _tool_blast_radius,
     _tool_cascade_preview,
     _tool_describe_migration_dependency,
     _tool_describe_model,
@@ -57,11 +60,12 @@ from django_orm_lens.mcp_server import (
     _tool_find_relations,
     _tool_list_apps,
     _tool_list_models,
+    _tool_migration_risk,
     _tool_nplusone_scan,
     _tool_signal_graph,
     _tool_suggest_indexes,
 )
-from django_orm_lens.workspace import WorkspaceError, clear_cache
+from orm_lens.workspace import WorkspaceError, clear_cache
 
 _MODELS_SOURCE = """from django.db import models
 
@@ -102,6 +106,7 @@ class ToolsRegistryTest(unittest.TestCase):
             "suggest_indexes",
             "signal_graph",
             "nplusone_scan",
+            "migration_risk",
             "blast_radius",
             "drift",
             "impact",
@@ -132,13 +137,13 @@ class ResolveHelperTest(unittest.TestCase):
     the bridge does not lose or corrupt the argument."""
 
     def setUp(self) -> None:
-        self._env = os.environ.get("DJANGO_ORM_LENS_ROOT")
-        os.environ.pop("DJANGO_ORM_LENS_ROOT", None)
+        self._env = os.environ.get("ORM_LENS_ROOT")
+        os.environ.pop("ORM_LENS_ROOT", None)
         self.tmp = Path(tempfile.mkdtemp(prefix="djol-server-"))
         _write_django_project(self.tmp)
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         if self._env is not None:
-            self.addCleanup(os.environ.__setitem__, "DJANGO_ORM_LENS_ROOT", self._env)
+            self.addCleanup(os.environ.__setitem__, "ORM_LENS_ROOT", self._env)
         clear_cache()
         self.addCleanup(clear_cache)
 
@@ -148,17 +153,17 @@ class ResolveHelperTest(unittest.TestCase):
         self.assertEqual(result, self.tmp.resolve())
 
     def test_missing_key_falls_through_to_env_or_cwd(self) -> None:
-        os.environ["DJANGO_ORM_LENS_ROOT"] = str(self.tmp)
+        os.environ["ORM_LENS_ROOT"] = str(self.tmp)
         result = _resolve({})
         self.assertIsInstance(result, Path)
 
     def test_empty_string_falls_through(self) -> None:
-        os.environ["DJANGO_ORM_LENS_ROOT"] = str(self.tmp)
+        os.environ["ORM_LENS_ROOT"] = str(self.tmp)
         result = _resolve({"workspace_root": ""})
         self.assertIsInstance(result, Path)
 
     def test_none_value_falls_through(self) -> None:
-        os.environ["DJANGO_ORM_LENS_ROOT"] = str(self.tmp)
+        os.environ["ORM_LENS_ROOT"] = str(self.tmp)
         result = _resolve({"workspace_root": None})
         self.assertIsInstance(result, Path)
 
@@ -168,13 +173,13 @@ class ErrorEnvelopeTest(unittest.TestCase):
     envelope — never an empty list, never a raw exception."""
 
     def setUp(self) -> None:
-        self._env = os.environ.get("DJANGO_ORM_LENS_ROOT")
-        os.environ.pop("DJANGO_ORM_LENS_ROOT", None)
+        self._env = os.environ.get("ORM_LENS_ROOT")
+        os.environ.pop("ORM_LENS_ROOT", None)
         self.tmp = Path(tempfile.mkdtemp(prefix="djol-envelope-"))
         # Deliberately do NOT write a Django project — every tool must fail.
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         if self._env is not None:
-            self.addCleanup(os.environ.__setitem__, "DJANGO_ORM_LENS_ROOT", self._env)
+            self.addCleanup(os.environ.__setitem__, "ORM_LENS_ROOT", self._env)
         clear_cache()
         self.addCleanup(clear_cache)
 
@@ -255,13 +260,13 @@ class HappyPathTest(unittest.TestCase):
     equivalence check that guards the behavioural-neutral half of the fix."""
 
     def setUp(self) -> None:
-        self._env = os.environ.get("DJANGO_ORM_LENS_ROOT")
-        os.environ.pop("DJANGO_ORM_LENS_ROOT", None)
+        self._env = os.environ.get("ORM_LENS_ROOT")
+        os.environ.pop("ORM_LENS_ROOT", None)
         self.tmp = Path(tempfile.mkdtemp(prefix="djol-happy-"))
         _write_django_project(self.tmp)
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         if self._env is not None:
-            self.addCleanup(os.environ.__setitem__, "DJANGO_ORM_LENS_ROOT", self._env)
+            self.addCleanup(os.environ.__setitem__, "ORM_LENS_ROOT", self._env)
         clear_cache()
         self.addCleanup(clear_cache)
 
@@ -273,6 +278,71 @@ class HappyPathTest(unittest.TestCase):
         self.assertEqual(payload[0]["name"], "myapp")
         self.assertEqual(payload[0]["models"], 2)
 
+    def test_migration_risk_rejects_an_unknown_severity(self) -> None:
+        payload = json.loads(
+            _tool_migration_risk({"workspace_root": str(self.tmp), "severity": "high"})
+        )
+        self.assertEqual(payload["error"], "INVALID_SEVERITY")
+        self.assertIn("critical", payload["hint"])
+        self.assertNotIn("findings", payload)
+
+    def test_migration_risk_accepts_every_documented_severity(self) -> None:
+        for severity in ("critical", "warning", "info", "all"):
+            with self.subTest(severity=severity):
+                payload = json.loads(
+                    _tool_migration_risk(
+                        {"workspace_root": str(self.tmp), "severity": severity}
+                    )
+                )
+                self.assertIn("findings", payload)
+
+    def test_migration_risk_detects_alembic_not_null_without_server_default(self) -> None:
+        versions = self.tmp / "alembic" / "versions"
+        versions.mkdir(parents=True, exist_ok=True)
+        header = (
+            "import sqlalchemy as sa\n"
+            "from alembic import op\n\n"
+            'revision = "{rev}"\n'
+            "down_revision = {down}\n"
+            "branch_labels = None\n\n\n"
+            "def upgrade():\n"
+        )
+        (versions / "aaa_init.py").write_text(
+            header.format(rev="aaa", down="None") + "    op.create_table('users', sa.Column('id', sa.Integer()))\n"
+        )
+        (versions / "bbb_add_col.py").write_text(
+            header.format(rev="bbb", down='"aaa"') + "    op.add_column('users', sa.Column('email', sa.String(), nullable=False))\n"
+        )
+        payload = json.loads(
+            _tool_migration_risk({"workspace_root": str(self.tmp), "severity": "critical"})
+        )
+        self.assertIn("findings", payload)
+        findings = payload["findings"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "critical")
+        self.assertEqual(findings[0]["operation"], "add_column")
+        self.assertEqual(findings[0]["model"], "users")
+        self.assertEqual(findings[0]["field"], "email")
+
+    def test_blast_radius_rejects_an_unknown_severity(self) -> None:
+        # "high" used to fall back to critical silently (#140).
+        payload = json.loads(
+            _tool_blast_radius({"workspace_root": str(self.tmp), "severity": "high"})
+        )
+        self.assertEqual(payload["error"], "INVALID_SEVERITY")
+        self.assertIn("critical", payload["hint"])
+        self.assertNotIn("targets", payload)
+
+    def test_blast_radius_accepts_every_documented_severity(self) -> None:
+        for severity in ("critical", "warning", "info", "all"):
+            with self.subTest(severity=severity):
+                payload = json.loads(
+                    _tool_blast_radius(
+                        {"workspace_root": str(self.tmp), "severity": severity}
+                    )
+                )
+                self.assertNotIn("error", payload)
+
     def test_list_models_returns_dotted_names(self) -> None:
         raw = _tool_list_models({"workspace_root": str(self.tmp)})
         self.assertIn("myapp.Author", raw)
@@ -282,7 +352,7 @@ class HappyPathTest(unittest.TestCase):
         result = _tool_er_diagram(
             {"workspace_root": str(self.tmp), "diagram_format": "dot"}
         )
-        self.assertTrue(result.startswith("digraph django_orm_lens {"))
+        self.assertTrue(result.startswith("digraph orm_lens {"))
         self.assertIn('subgraph "cluster_myapp" {', result)
 
     def test_describe_model_returns_field_detail(self) -> None:
@@ -298,7 +368,7 @@ class HappyPathTest(unittest.TestCase):
     def test_env_var_is_still_honoured(self) -> None:
         # Backwards-compat guarantee: the historical env-var-only workflow
         # still works when no explicit arg is passed.
-        os.environ["DJANGO_ORM_LENS_ROOT"] = str(self.tmp)
+        os.environ["ORM_LENS_ROOT"] = str(self.tmp)
         raw = _tool_list_apps({})
         payload = json.loads(raw)
         self.assertIsInstance(payload, list)
@@ -339,9 +409,8 @@ def _registered_server():
     from the real signatures."""
     import contextlib
     import io
-    from unittest import mock
 
-    from django_orm_lens import mcp_server
+    from orm_lens import mcp_server
 
     loaded = _load_server_class()
     if loaded is None:
@@ -353,7 +422,7 @@ def _registered_server():
         def run(self, *args, **kwargs):
             captured.append(self)
 
-    with mock.patch.object(
+    with unittest.mock.patch.object(
         mcp_server, "_load_server_class", return_value=(_NoRun, takes_version)
     ), contextlib.redirect_stderr(io.StringIO()):
         mcp_server.main()
@@ -438,7 +507,7 @@ class AdvertisedVersionTest(unittest.TestCase):
     def test_sets_the_package_version_on_the_low_level_server(self) -> None:
         if FastMCP is None:
             self.skipTest("mcp extra not installed")
-        server = FastMCP("django-orm-lens")
+        server = FastMCP("orm-lens")
         self.assertEqual(_advertise_our_version(server), __version__)
         self.assertEqual(_lowlevel_handle(server).version, __version__)
 
@@ -451,11 +520,11 @@ class AdvertisedVersionTest(unittest.TestCase):
         """
         if FastMCP is None:
             self.skipTest("mcp extra not installed")
-        server = FastMCP("django-orm-lens")
+        server = FastMCP("orm-lens")
         _advertise_our_version(server)
         opts = _lowlevel_handle(server).create_initialization_options()
         self.assertEqual(opts.server_version, __version__)
-        self.assertEqual(opts.server_name, "django-orm-lens")
+        self.assertEqual(opts.server_name, "orm-lens")
 
     def test_unexpected_sdk_shape_is_survivable(self) -> None:
         """A stub without the private handle must not raise."""
@@ -534,6 +603,84 @@ class LoadServerClassTests(unittest.TestCase):
         self.assertIsNone(
             self._run_with_modules({"mcp.server": types.ModuleType("mcp.server")})
         )
+
+
+class CascadePreviewSkippedReceiversTests(unittest.TestCase):
+    """The MCP tool and the CLI share skipped_delete_receivers, so an agent
+    asking about a delete hears that DB_CASCADE silences the handlers."""
+
+    def test_tool_lists_receivers_skipped_by_db_cascade(self) -> None:
+        import tempfile
+        from pathlib import Path as _Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            app = _Path(tmp) / "shop"
+            app.mkdir()
+            (app / "models.py").write_text(
+                "from django.db import models\n"
+                "class Order(models.Model):\n"
+                "    pass\n"
+                "class Line(models.Model):\n"
+                "    order = models.ForeignKey(Order, models.DB_CASCADE)\n",
+                encoding="utf-8",
+            )
+            (app / "signals.py").write_text(
+                "from django.db.models.signals import post_delete\n"
+                "from django.dispatch import receiver\n"
+                "@receiver(post_delete, sender='shop.Line')\n"
+                "def drop_file(sender, instance, **kw):\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            clear_cache()
+            self.addCleanup(clear_cache)
+            payload = json.loads(
+                _tool_cascade_preview(
+                    {"workspace_root": tmp, "app_label": "shop", "model_name": "Order"}
+                )
+            )
+        (line,) = payload["cascade_kills"]
+        self.assertTrue(line["db_level"])
+        self.assertEqual(
+            [r["handler"] for r in line["skipped_receivers"]],
+            ["shop.signals.drop_file"],
+        )
+
+
+class MissingSdkMessageTests(unittest.TestCase):
+    """The no-SDK message must point at something that can work.
+
+    On 3.9 the [mcp] extra resolves nothing, because no mcp release supports
+    that Python. Telling a 3.9 user to `pip install 'orm-lens[mcp]'`
+    is a loop: they just did, and the server is still missing.
+    """
+
+    def test_python_39_names_the_floor_instead_of_the_extra(self) -> None:
+        msg = _missing_sdk_message((3, 9, 25, "final", 0))
+        self.assertIn("needs Python 3.10+", msg)
+        self.assertIn("this is 3.9.25", msg)
+        self.assertIn("uvx --python 3.12", msg)
+        self.assertNotIn("install with: pip install", msg)
+
+    def test_supported_python_still_points_at_the_extra(self) -> None:
+        for vi in ((3, 10, 0), (3, 14, 1)):
+            msg = _missing_sdk_message(vi)
+            self.assertIn("install with: pip install 'orm-lens[mcp]'", msg)
+            self.assertNotIn("needs Python 3.10+", msg)
+
+    def test_main_prints_the_message_and_exits_3(self) -> None:
+        import contextlib
+        import io
+
+        from orm_lens import mcp_server
+
+        err = io.StringIO()
+        with unittest.mock.patch.object(
+            mcp_server, "_load_server_class", return_value=None
+        ), contextlib.redirect_stderr(err):
+            code = mcp_server.main()
+        self.assertEqual(code, 3)
+        self.assertEqual(err.getvalue().strip(), _missing_sdk_message().strip())
 
 
 if __name__ == "__main__":

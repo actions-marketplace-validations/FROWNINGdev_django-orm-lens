@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from django_orm_lens.migrations_parser import (
+from orm_lens.migrations_parser import (
     MigrationRisk,
     MigrationRiskAnalyzer,
     analyze_migration_risks,
@@ -213,12 +213,18 @@ class RemoveFieldAndDeleteModelTest(unittest.TestCase):
                 "    operations = [migrations.RemoveField(model_name='order',\n"
                 "        name='status')]\n",
             )
-            # `status` NOT in schema → safe.
+            # `status` NOT in schema → no critical, but still an info flag
+            # so reviewers (and blast_radius) see the dropped column (#140).
             schema = {"orders": {"order": {"id"}}}
             findings = analyze_migration_risks(tmp, current_schema=schema)
-            self.assertNotIn(
-                "remove_field_still_referenced", _by_rule(findings)
-            )
+            rules = _by_rule(findings)
+            self.assertNotIn("remove_field_still_referenced", rules)
+            self.assertNotIn("remove_field_unverified", rules)
+            self.assertIn("remove_field", rules)
+            f = rules["remove_field"][0]
+            self.assertEqual(f.severity, "info")
+            self.assertEqual(f.field, "status")
+            self.assertEqual(f.model, "order")
 
     def test_positive_delete_model_still_referenced(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -785,6 +791,245 @@ class EdgeCaseTest(unittest.TestCase):
                 migration_index=1,
             )
             self.assertEqual(analyzer.analyze(), [])
+
+
+# ---------------------------------------------------------------------------
+# Real-world precision: each case below was a false "critical" on NetBox,
+# PostHog, authentik, Plane, paperless-ngx or Healthchecks (407 findings
+# before, 2 real ones after).
+# ---------------------------------------------------------------------------
+
+_INITIAL = (
+    "from django.db import migrations, models\n"
+    "class Migration(migrations.Migration):\n"
+    "    dependencies = []\n"
+    "    operations = [migrations.CreateModel(name='Order', fields=[])]\n"
+)
+
+
+def _second(ops: str, extra: str = "", header: str = "") -> str:
+    return (
+        "import django.db.models.deletion\n"
+        "from django.db import migrations, models\n"
+        f"{header}"
+        "class Migration(migrations.Migration):\n"
+        "    dependencies = [('orders', '0001_initial')]\n"
+        f"{extra}"
+        f"    operations = [\n{ops}    ]\n"
+    )
+
+
+class RealWorldPrecisionTest(unittest.TestCase):
+    def _rules(self, ops: str, extra: str = "", header: str = "", schema=None):
+        with TemporaryDirectory() as tmp:
+            app = Path(tmp) / "orders"
+            _write(app, "0001_initial", _INITIAL)
+            _write(app, "0002_change", _second(ops, extra, header))
+            findings = analyze_migration_risks(
+                tmp, current_schema=schema if schema is not None else _empty_schema()
+            )
+        return _by_rule(findings)
+
+    def _add(self, field: str) -> str:
+        return f"        migrations.AddField(model_name='order', name='x', field={field}),\n"
+
+    def test_fields_without_a_column_are_not_not_null_risks(self) -> None:
+        for field in (
+            "models.ManyToManyField(to='orders.Order')",
+            "taggit.managers.TaggableManager(through='extras.TaggedItem', to='extras.Tag')",
+        ):
+            self.assertNotIn("add_field_not_null_no_default", self._rules(self._add(field)), field)
+
+    def test_django_fills_blank_strings_auto_now_and_db_default(self) -> None:
+        for field in (
+            "models.CharField(blank=True, max_length=50)",
+            "models.TextField(blank=True)",
+            "utilities.fields.ColorField(blank=True, max_length=6)",
+            "LowercaseSlugField(blank=True)",
+            "models.DateTimeField(auto_now_add=True)",
+            "models.DateField(auto_now=True)",
+            "models.IntegerField(db_default=0)",
+        ):
+            self.assertNotIn("add_field_not_null_no_default", self._rules(self._add(field)), field)
+
+    def test_real_not_null_risks_still_fire(self) -> None:
+        for field in (
+            "models.CharField(max_length=50)",
+            "models.IntegerField(blank=True)",  # no empty string for integers
+            "models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to='orders.order')",
+        ):
+            rules = self._rules(self._add(field))
+            self.assertIn("add_field_not_null_no_default", rules, field)
+            self.assertEqual(rules["add_field_not_null_no_default"][0].severity, "critical")
+
+    def test_table_created_in_the_same_migration_is_empty(self) -> None:
+        ops = (
+            "        migrations.CreateModel(name='Line', fields=[]),\n"
+            "        migrations.AddField(model_name='line', name='order', field=models.ForeignKey("
+            "on_delete=django.db.models.deletion.CASCADE, to='orders.order')),\n"
+            "        migrations.AddIndex(model_name='line', index=models.Index(fields=['order'], name='i')),\n"
+        )
+        rules = self._rules(ops)
+        self.assertNotIn("add_field_not_null_no_default", rules)
+        self.assertNotIn("add_index_locks_table", rules)
+        # The same AddIndex on an existing table still flags.
+        existing = self._rules(
+            "        migrations.AddIndex(model_name='order', index=models.Index(fields=['id'], name='i')),\n"
+        )
+        self.assertIn("add_index_locks_table", existing)
+
+    def test_squashed_migration_only_runs_on_a_fresh_database(self) -> None:
+        rules = self._rules(
+            self._add("models.CharField(max_length=50)"),
+            extra="    replaces = [('orders', '0002_a'), ('orders', '0003_b')]\n",
+        )
+        self.assertNotIn("add_field_not_null_no_default", rules)
+
+    def test_nullable_unique_column_fills_rows_with_null(self) -> None:
+        for field in (
+            "models.CharField(blank=True, max_length=12, null=True, unique=True)",
+            "models.UUIDField(null=True, unique=True)",
+            "models.TextField(default=None, null=True, unique=True)",
+        ):
+            self.assertNotIn("add_field_unique_no_row_default", self._rules(self._add(field)), field)
+        rules = self._rules(self._add("models.CharField(max_length=5, default='x', unique=True)"))
+        self.assertIn("add_field_unique_no_row_default", rules)
+
+    def test_data_operation_first_downgrades_not_null(self) -> None:
+        add = self._add("models.CharField(max_length=50)")
+        python_first = self._rules("        migrations.RunPython(wipe, migrations.RunPython.noop),\n" + add)
+        f = python_first["add_field_not_null_no_default"][0]
+        self.assertEqual((f.severity, f.confidence), ("warning", "medium"))
+        delete_first = self._rules(
+            "        migrations.RunSQL(WIPE, migrations.RunSQL.noop),\n" + add,
+            header="WIPE = 'DELETE FROM orders_order'\n",
+        )
+        self.assertEqual(delete_first["add_field_not_null_no_default"][0].severity, "warning")
+        # DDL that leaves the rows alone does not soften anything.
+        ddl_first = self._rules(
+            "        migrations.RunSQL(DROP, migrations.RunSQL.noop),\n" + add,
+            header="DROP = 'DROP FUNCTION f'\n",
+        )
+        self.assertEqual(ddl_first["add_field_not_null_no_default"][0].severity, "critical")
+
+    def test_name_brought_back_later_is_not_still_referenced(self) -> None:
+        schema = {"orders": {"order": {"id", "groups", "status"}}}
+        readd = (
+            "        migrations.RemoveField(model_name='order', name='groups'),\n"
+            "        migrations.AddField(model_name='order', name='groups', field=models.ManyToManyField(to='auth.group')),\n"
+        )
+        self.assertNotIn("remove_field_still_referenced", self._rules(readd, schema=schema))
+        rename = (
+            "        migrations.RemoveField(model_name='order', name='status'),\n"
+            "        migrations.RenameField(model_name='order', old_name='status_v2', new_name='status'),\n"
+        )
+        self.assertNotIn("remove_field_still_referenced", self._rules(rename, schema=schema))
+        recreate = (
+            "        migrations.DeleteModel(name='Order'),\n"
+            "        migrations.CreateModel(name='Order', fields=[]),\n"
+        )
+        self.assertNotIn("delete_model_still_referenced", self._rules(recreate, schema=schema))
+        gone = "        migrations.RemoveField(model_name='order', name='status'),\n"
+        self.assertIn("remove_field_still_referenced", self._rules(gone, schema=schema))
+
+    def test_squash_replacing_migrations_is_not_a_second_leaf(self) -> None:
+        def mig(deps: str, extra: str = "") -> str:
+            return (
+                "from django.db import migrations\n"
+                "class Migration(migrations.Migration):\n"
+                f"    dependencies = [{deps}]\n{extra}"
+                "    operations = []\n"
+            )
+
+        with TemporaryDirectory() as tmp:
+            app = Path(tmp) / "orders"
+            _write(app, "0001_initial", mig(""))
+            _write(app, "0002_b", mig("('orders', '0001_initial')"))
+            _write(
+                app,
+                "0001_squashed_0002_b",
+                mig("", "    replaces = [('orders', '0001_initial'), ('orders', '0002_b')]\n"),
+            )
+            _write(app, "0003_c", mig("('orders', '0002_b')"))
+            findings = analyze_migration_risks(tmp, current_schema=_empty_schema())
+        self.assertNotIn("conflicting_migration_leaves", _by_rule(findings))
+
+
+class DependencyOrderedIndexTest(unittest.TestCase):
+    """The migration index follows Django's order, not the filename order.
+
+    Index 0 is the one migration the analyzer assumes runs against an empty
+    database. A file that sorts first by name but depends on later ones must
+    not take that slot, or every finding behind it is swallowed.
+    """
+
+    def _migration(self, deps: str, operations: str) -> str:
+        return (
+            "from django.db import migrations, models\n\n"
+            "class Migration(migrations.Migration):\n"
+            f"    dependencies = {deps}\n"
+            "    operations = [\n"
+            f"{operations}"
+            "    ]\n"
+        )
+
+    def test_dependency_only_name_is_not_treated_as_the_first_migration(self) -> None:
+        with TemporaryDirectory() as tmp:
+            app = Path(tmp) / "shop"
+            _write(
+                app,
+                "0001_initial",
+                self._migration(
+                    "[]",
+                    "        migrations.CreateModel(name='Customer', fields=[]),\n",
+                ),
+            )
+            _write(
+                app,
+                "0002_customer_code",
+                self._migration(
+                    "[('shop', '0001_initial')]",
+                    "        migrations.AddField(model_name='customer', name='code',\n"
+                    "            field=models.CharField(max_length=10, null=True)),\n",
+                ),
+            )
+            _write(
+                app,
+                "add_rank",
+                self._migration(
+                    "[('shop', '0002_customer_code')]",
+                    "        migrations.AddField(model_name='customer', name='rank',\n"
+                    "            field=models.IntegerField()),\n",
+                ),
+            )
+            findings = analyze_migration_risks(tmp, current_schema=_empty_schema())
+
+        rules = _by_rule(findings)
+        self.assertIn("add_field_not_null_no_default", rules)
+        self.assertEqual(
+            [f.migration for f in rules["add_field_not_null_no_default"]], ["add_rank"]
+        )
+
+    def test_helper_module_does_not_take_a_migration_index(self) -> None:
+        # A constants module matches the filename filter and sorts before
+        # `0001_initial` (it has no numeric prefix), but it is not a migration:
+        # it must not push the app's first migration to index 1, where the
+        # table is assumed to hold rows.
+        with TemporaryDirectory() as tmp:
+            app = Path(tmp) / "shop"
+            _write(app, "branding", "ACCENT = 'blue'\n")
+            _write(
+                app,
+                "0001_initial",
+                self._migration(
+                    "[]",
+                    "        migrations.AddField(model_name='customer', name='rank',\n"
+                    "            field=models.IntegerField()),\n",
+                ),
+            )
+            findings = analyze_migration_risks(tmp, current_schema=_empty_schema())
+
+        self.assertNotIn("add_field_not_null_no_default", _by_rule(findings))
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from django_orm_lens.cli import main
+from orm_lens.cli import main
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures"
 MINIAPP = FIXTURE_ROOT / "miniapp"
@@ -64,7 +64,7 @@ class CascadeCommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         payload = json.loads(out)
         self.assertEqual(payload["target"], "orders.Order")
-        for bucket in ("cascade_kills", "set_null", "protected"):
+        for bucket in ("cascade_kills", "set_null", "protected", "unhandled"):
             self.assertIn(bucket, payload)
         kills = payload["cascade_kills"]
         self.assertEqual(len(kills), 1)
@@ -104,6 +104,168 @@ class CascadeCommandTest(unittest.TestCase):
             self.assertTrue(payload["set_null"][0]["self"])
             self.assertEqual(payload["protected"][0]["via_field"], "protected_parent")
             self.assertTrue(payload["protected"][0]["self"])
+
+    def test_django_61_db_level_policies_are_bucketed(self) -> None:
+        """DB_CASCADE / DB_SET_NULL / DB_SET_DEFAULT (Django 6.1) used to fall
+        out of every bucket, so the delete looked isolated while the
+        database would cascade."""
+        with TemporaryDirectory() as tmp:
+            _write(
+                Path(tmp) / "shop" / "models.py",
+                "from django.db import models\n\n"
+                "class Order(models.Model):\n"
+                "    pass\n\n"
+                "class Line(models.Model):\n"
+                "    order = models.ForeignKey(Order, on_delete=models.DB_CASCADE)\n\n"
+                "class Note(models.Model):\n"
+                "    order = models.ForeignKey(Order, null=True, "
+                "on_delete=models.DB_SET_NULL)\n\n"
+                "class Tag(models.Model):\n"
+                "    order = models.ForeignKey(Order, default=1, "
+                "on_delete=models.DB_SET_DEFAULT)\n\n"
+                "class Refund(models.Model):\n"
+                "    order = models.ForeignKey(Order, on_delete=models.CASCADE)\n",
+            )
+            code, out, _err = _run(["cascade", "shop.Order", "--path", tmp])
+            self.assertEqual(code, 0)
+            self.assertNotIn("the delete is isolated", out)
+            self.assertIn("shop.Line  via order (db)", out)
+            self.assertIn("shop.Note  via order (db)", out)
+            self.assertIn("shop.Tag  via order (db)", out)
+            self.assertIn("shop.Refund  via order\n", out)
+            self.assertIn("Django sends no delete signals", out)
+
+            code, out, _err = _run(
+                ["cascade", "shop.Order", "--path", tmp, "--format", "json"]
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            kills = {e["model"]: e for e in payload["cascade_kills"]}
+            self.assertEqual(set(kills), {"shop.Line", "shop.Refund"})
+            self.assertTrue(kills["shop.Line"]["db_level"])
+            self.assertNotIn("db_level", kills["shop.Refund"])
+            nulls = {e["model"]: e for e in payload["set_null"]}
+            self.assertEqual(set(nulls), {"shop.Note", "shop.Tag"})
+            self.assertTrue(all(e["db_level"] for e in nulls.values()))
+
+    def test_do_nothing_is_reported_not_isolated(self) -> None:
+        """DO_NOTHING used to fall out of every bucket, so a delete that the
+        FK constraint rejects was reported as isolated."""
+        from orm_lens.blast_radius import _cascade_line
+
+        with TemporaryDirectory() as tmp:
+            _write(
+                Path(tmp) / "shop" / "models.py",
+                "from django.db import models\n\n"
+                "class Order(models.Model):\n"
+                "    pass\n\n"
+                "class Audit(models.Model):\n"
+                "    order = models.ForeignKey(Order, on_delete=models.DO_NOTHING)\n\n"
+                "class Mirror(models.Model):\n"
+                "    order = models.ForeignKey(Order, models.DO_NOTHING, "
+                "db_constraint=False)\n",
+            )
+            code, out, _err = _run(["cascade", "shop.Order", "--path", tmp])
+            self.assertEqual(code, 0)
+            self.assertNotIn("the delete is isolated", out)
+            self.assertIn("left as-is by DO_NOTHING in (2):", out)
+            self.assertIn("shop.Audit  via order\n", out)
+            self.assertIn("shop.Mirror  via order (no constraint)", out)
+            self.assertIn("IntegrityError", out)
+            self.assertIn("points nowhere", out)
+
+            code, out, _err = _run(
+                ["cascade", "shop.Order", "--path", tmp, "--format", "json"]
+            )
+            payload = json.loads(out)
+            left = {e["model"]: e for e in payload["unhandled"]}
+            self.assertEqual(set(left), {"shop.Audit", "shop.Mirror"})
+            self.assertNotIn("db_constraint", left["shop.Audit"])
+            self.assertIs(left["shop.Mirror"]["db_constraint"], False)
+            self.assertEqual(payload["cascade_kills"], [])
+            self.assertEqual(
+                _cascade_line(payload),
+                "cascade: 0 deleted, 0 nulled, 0 blocked by PROTECT, "
+                "2 left by DO_NOTHING",
+            )
+
+    def test_cascade_line_unchanged_without_do_nothing(self) -> None:
+        from orm_lens.blast_radius import _cascade_line
+
+        self.assertEqual(
+            _cascade_line({"cascade_kills": [{}], "set_null": [], "protected": []}),
+            "cascade: 1 deleted, 0 nulled, 0 blocked by PROTECT",
+        )
+
+    def test_db_cascade_lists_delete_receivers_that_will_not_run(self) -> None:
+        """DB_CASCADE rows are deleted by the database, so their pre_delete /
+        post_delete receivers never fire. cascade names them."""
+        with TemporaryDirectory() as tmp:
+            _write(
+                Path(tmp) / "shop" / "models.py",
+                "from django.db import models\n\n"
+                "class Order(models.Model):\n"
+                "    pass\n\n"
+                "class Line(models.Model):\n"
+                "    order = models.ForeignKey(Order, on_delete=models.DB_CASCADE)\n\n"
+                "class Refund(models.Model):\n"
+                "    order = models.ForeignKey(Order, on_delete=models.CASCADE)\n",
+            )
+            _write(
+                Path(tmp) / "shop" / "signals.py",
+                "from django.db.models.signals import post_delete, post_save, pre_delete\n"
+                "from django.dispatch import receiver\n"
+                "from .models import Line, Refund\n\n"
+                "@receiver(post_delete, sender=Line)\n"
+                "def audit_line(sender, instance, **kw):\n"
+                "    pass\n\n"
+                "@receiver(pre_delete)\n"
+                "def audit_everything(sender, instance, **kw):\n"
+                "    pass\n\n"
+                "@receiver(post_save, sender=Line)\n"
+                "def touch_line(sender, instance, **kw):\n"
+                "    pass\n\n"
+                "@receiver(post_delete, sender=Refund)\n"
+                "def audit_refund(sender, instance, **kw):\n"
+                "    pass\n",
+            )
+            _write(
+                Path(tmp) / "shop" / "apps.py",
+                "from django.db.models.signals import post_delete\n"
+                "from .models import Line\n\n"
+                "def ready():\n"
+                "    post_delete.connect(files.delete_line_file, sender=Line)\n",
+            )
+            code, out, _err = _run(
+                ["cascade", "shop.Order", "--path", tmp, "--format", "json"]
+            )
+            self.assertEqual(code, 0)
+            kills = {e["model"]: e for e in json.loads(out)["cascade_kills"]}
+            skipped = {r["handler"]: r for r in kills["shop.Line"]["skipped_receivers"]}
+            self.assertEqual(
+                set(skipped),
+                {
+                    "shop.signals.audit_line",
+                    "shop.signals.audit_everything",
+                    "files.delete_line_file",
+                },
+            )
+            self.assertEqual(skipped["shop.signals.audit_line"]["signal"], "post_delete")
+            # A receiver wired with .connect() is silenced just the same.
+            self.assertEqual(skipped["files.delete_line_file"]["file"], "shop/apps.py:5")
+            # signal_graph points at the handler's `def` line, under its decorator.
+            self.assertEqual(skipped["shop.signals.audit_line"]["file"], "shop/signals.py:6")
+            # ORM CASCADE still sends the signals, so nothing is skipped there.
+            self.assertNotIn("skipped_receivers", kills["shop.Refund"])
+
+            code, out, _err = _run(["cascade", "shop.Order", "--path", tmp])
+            self.assertIn("! 3 delete receiver(s) will NOT run for (db) rows:", out)
+            self.assertIn("post_delete shop.signals.audit_line  for shop.Line", out)
+
+    def test_orm_level_policies_print_no_db_footnote(self) -> None:
+        code, out, _err = _run(["cascade", "orders.Order", "--path", str(MINIAPP)])
+        self.assertEqual(code, 0)
+        self.assertNotIn("(db)", out)
 
     def test_unknown_model_exits_2(self) -> None:
         code, out, err = _run(
@@ -161,6 +323,39 @@ class SuggestIndexesCommandTest(unittest.TestCase):
             )
             self.assertEqual(code, 2)
             self.assertIn("'GhostModel' not found", err)
+
+    def test_include_tests_flag(self) -> None:
+        with TemporaryDirectory() as tmp:
+            blog = Path(tmp) / "blog"
+            _write(
+                blog / "models.py",
+                "from django.db import models\n\n\n"
+                "class Article(models.Model):\n"
+                "    status = models.CharField(max_length=20)\n",
+            )
+            _write(
+                blog / "tests" / "test_views.py",
+                "from blog.models import Article\n\n\n"
+                "def test_one():\n"
+                "    return Article.objects.filter(status='draft')\n\n\n"
+                "def test_two():\n"
+                "    return Article.objects.filter(status='published')\n",
+            )
+            # Default: no proposals from test files
+            code, out, _err = _run(
+                ["suggest-indexes", "Article", "--path", tmp, "--format", "json"]
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertEqual(payload.get("proposed_indexes", []), [])
+
+            # With --include-tests
+            code, out, _err = _run(
+                ["suggest-indexes", "Article", "--path", tmp, "--format", "json", "--include-tests"]
+            )
+            self.assertEqual(code, 0)
+            payload = json.loads(out)
+            self.assertIn(["status"], [p["fields"] for p in payload.get("proposed_indexes", [])])
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +554,7 @@ class CiFormatSmokeTest(unittest.TestCase):
         self.assertIn("migrations/0002_add_status.py", line)
         self.assertIn(",line=", line)
         self.assertIn(
-            "title=django-orm-lens%3A add_field_not_null_no_default", line
+            "title=orm-lens%3A add_field_not_null_no_default", line
         )
 
     def test_migration_risk_github_silent_and_green_on_safe_fixture(self) -> None:
@@ -399,25 +594,25 @@ if __name__ == "__main__":
 
 
 class ModuleEntryPointTests(unittest.TestCase):
-    """`python -m django_orm_lens` must work wherever the console script does.
+    """`python -m orm_lens` must work wherever the console script does.
 
     Regression guard: the package shipped without a __main__.py through
-    1.5.0, so `python -m django_orm_lens` failed with "No module named
-    django_orm_lens.__main__" even though the CLI itself was fine.
+    1.5.0, so `python -m orm_lens` failed with "No module named
+    orm_lens.__main__" even though the CLI itself was fine.
     """
 
     def test_module_invocation_reports_version(self) -> None:
         proc = subprocess.run(
-            [sys.executable, "-m", "django_orm_lens", "--version"],
+            [sys.executable, "-m", "orm_lens", "--version"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=60,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("django-orm-lens", proc.stdout)
+        self.assertIn("orm-lens", proc.stdout)
 
     def test_module_invocation_matches_console_script_help(self) -> None:
         proc = subprocess.run(
-            [sys.executable, "-m", "django_orm_lens", "--help"],
+            [sys.executable, "-m", "orm_lens", "--help"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=60,
         )

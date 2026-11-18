@@ -6,18 +6,23 @@ on:
       - 'py-v*'
   workflow_dispatch:
 
-# OIDC — GitHub mints a short-lived token per run that PyPI verifies through
-# its Trusted Publisher config. Removes the long-lived PYPI_API_TOKEN secret
-# and its rotation surface. See:
-# https://docs.pypi.org/trusted-publishers/
+# Publishes orm-lens (cli/). The pre-rename django-orm-lens package
+# (compat/django-orm-lens/) depends on orm-lens>=1.17.1,<2 and so follows
+# every 1.x release on its own; it is not built here, and is uploaded by hand
+# on the rare change to it.
 #
-# ⚠️  PyPI-side setup required (one-time):
-#   1. https://pypi.org/manage/project/django-orm-lens/settings/publishing/
-#   2. Add trusted publisher — owner=FROWNINGdev, repo=django-orm-lens,
-#      workflow=publish-pypi.yml, environment=pypi
-#   3. After it lands, delete the PYPI_API_TOKEN repo secret.
-# Until step 1-2 are done, the next tag push fails at the Publish step with
-# a 403 from PyPI — safe failure mode, no bad publish.
+# OIDC - GitHub mints a short-lived token per run that PyPI verifies through
+# its Trusted Publisher config. See https://docs.pypi.org/trusted-publishers/
+#
+# PyPI-side setup (one-time), owner=FROWNINGdev, repo=orm-lens,
+# workflow=publish-pypi.yml, environment=pypi:
+#   https://pypi.org/manage/project/orm-lens/settings/publishing/
+# PyPI matches on the repository name, so a publisher created before the
+# rename (repo=django-orm-lens) no longer applies.
+#
+# A release can also be uploaded by hand with twine first. The step below
+# then sees the version already on PyPI and skips the upload, so the rest
+# of the release (release page, MCP Registry, container) still runs.
 permissions:
   contents: write   # the Release step below creates the tag's release page
   id-token: write   # required for OIDC
@@ -36,20 +41,29 @@ jobs:
       - name: Install build tools
         run: python -m pip install --upgrade build twine
 
-      - name: Build sdist + wheel
-        working-directory: cli
-        run: python -m build
+      - name: Build orm-lens
+        run: |
+          python -m build cli --outdir dist
+          ls -l dist
 
       - name: twine check
-        working-directory: cli
         run: python -m twine check dist/*
 
+      - name: Skip the upload if this version is already on PyPI
+        id: onpypi
+        run: |
+          VER="$(python -c "import tomllib; print(tomllib.load(open('cli/pyproject.toml','rb'))['project']['version'])")"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/orm-lens/${VER}/json")
+          echo "orm-lens==${VER}: HTTP ${code}"
+          if [ "$code" = "200" ]; then echo "skip=true"; else echo "skip=false"; fi >> "$GITHUB_OUTPUT"
+
       - name: Publish to PyPI (OIDC trusted publisher)
+        if: steps.onpypi.outputs.skip != 'true'
         # Pin to a full commit SHA (v1.13.0) so a poisoned tag push cannot
-        # silently swap the action. Bump manually — Dependabot will notify.
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+        # silently swap the action. Bump manually - Dependabot will notify.
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086
         with:
-          packages-dir: cli/dist
+          packages-dir: dist
           skip-existing: true
 
       # py-v1.7.0, 1.7.1, 1.8.0 and 1.8.1 all published to every registry and
@@ -60,44 +74,9 @@ jobs:
       # shipped.
       - name: Release notes from CHANGELOG
         id: notes
-        run: |
-          python - "$TAG" <<'PY'
-          import os, pathlib, re, sys
-
-          tag = sys.argv[1]                      # py-v1.8.1
-          heading = tag.replace("py-v", "py-")   # py-1.8.1
-          lines = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8").splitlines()
-          starts = [i for i, l in enumerate(lines) if l.startswith("## ")]
-          body = ""
-          for n, i in enumerate(starts):
-              if re.match(rf"## \[{re.escape(heading)}\]", lines[i]):
-                  end = starts[n + 1] if n + 1 < len(starts) else len(lines)
-                  body = "\n".join(lines[i + 1:end]).strip()
-                  break
-          if not body:
-              # No section is not a reason to fail the publish - the package is
-              # already on PyPI by this point. Ship a stub and say so.
-              body = f"See CHANGELOG.md for {heading}."
-              print(f"::warning::no CHANGELOG section for {heading}")
-          pathlib.Path("release-notes.md").write_text(body + "\n", encoding="utf-8")
-          print(f"wrote {len(body)} chars of notes for {tag}")
-
-          # Title the release after its headline change. A page called just
-          # "py-v1.9.0" tells a reader nothing the tag did not already say,
-          # while every hand-made page carries a subtitle.
-          lead = re.search(r"^- \*\*(.+?)\*\*", body, re.M)
-          title = tag
-          if lead:
-              # A release title is plain text on GitHub - backticks would show
-              # up as backticks.
-              subtitle = " ".join(lead.group(1).replace("`", "").split()).rstrip(".")
-              if len(subtitle) > 70:
-                  subtitle = subtitle[:67].rstrip() + "..."
-              title = f"{tag} - {subtitle}"
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-              fh.write(f"title={title}\n")
-          print("release title:", title)
-          PY
+        # Title: the section's "> headline" line, else its first bold bullet.
+        # Shared with publish.yml - see scripts/release_notes.py.
+        run: python scripts/release_notes.py "$TAG"
         env:
           TAG: ${{ github.ref_name }}
 

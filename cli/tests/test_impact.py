@@ -1,4 +1,4 @@
-"""Tests for the Python impact analyzer (cli/django_orm_lens/impact.py).
+"""Tests for the Python impact analyzer (cli/orm_lens/impact.py).
 
 Mirrors the intent of the TypeScript impact-analysis tests — the two
 implementations must classify the same line the same way, so these cases are
@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from django_orm_lens.impact import (
+from orm_lens.impact import (
     ImpactFinding,
     classify_line,
     detect_layer,
@@ -119,6 +119,16 @@ class ScanFileTextTest(unittest.TestCase):
         self.assertEqual(found[0].column, text.splitlines()[1].index("author"))
         self.assertEqual(found[0].layer, "views")
         self.assertEqual(found[0].confidence, "certain")
+
+    def test_column_points_at_the_reference_not_an_earlier_prefix(self) -> None:
+        """``authors`` is a different identifier, so its column must not be
+        reported; the match is ``book.author`` further along the line."""
+        line = "authors = get_authors(); item = book.author.name"
+        found = scan_file_text("blog/views.py", line + "\n", "author")
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            found[0].column, line.index("book.author") + len("book.")
+        )
 
     def test_snippet_is_trimmed_and_capped(self) -> None:
         text = "    " + "x" * 400 + " author\n"
@@ -247,7 +257,7 @@ class JsonLineContractTest(unittest.TestCase):
         self.assertEqual(found[0].to_dict()["line"], 2)  # serialized, 1-based
 
     def test_json_and_text_cli_output_agree_on_a_known_line(self) -> None:
-        from django_orm_lens.cli import main
+        from orm_lens.cli import main
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

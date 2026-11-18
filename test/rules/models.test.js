@@ -62,6 +62,16 @@ test('DOL011 leaves CharField without null=True alone', () => {
   assert.equal(findings.length, 0);
 });
 
+test('DOL011 reads past nested calls before null=True', () => {
+  const rule = ruleByCode('DOL011');
+  for (const src of [
+    'name = models.CharField(max_length=100, verbose_name=_("Name"), null=True)',
+    'bio = models.TextField(verbose_name=gettext("Bio"), null=True)',
+  ]) {
+    assert.equal(rule.check(makeCtx(src)).length, 1, src);
+  }
+});
+
 test('DOL012 flags a Model class with no __str__', () => {
   const rule = ruleByCode('DOL012');
   const src = [
@@ -127,9 +137,94 @@ test('DOL013 leaves ForeignKey with on_delete alone', () => {
   assert.equal(findings.length, 0);
 });
 
+test('DOL013 accepts a positional on_delete, as Django contrib writes it', () => {
+  // ForeignKey(to, on_delete, ...). Flagging it was an error-severity false
+  // positive, and the fixer then added a duplicate on_delete= that raises.
+  const rule = ruleByCode('DOL013');
+  for (const src of [
+    'order = models.ForeignKey(Order, models.CASCADE)',
+    'user = models.ForeignKey(settings.AUTH_USER_MODEL, models.CASCADE, verbose_name="user")',
+    'ct = models.ForeignKey(ContentType, my_policy, related_name="x")',
+  ]) {
+    assert.equal(rule.check(makeCtx(src)).length, 0, src);
+  }
+});
+
+test('DOL013 still flags one positional plus keywords', () => {
+  const rule = ruleByCode('DOL013');
+  for (const src of [
+    "author = models.ForeignKey(Author, related_name='books')",
+    'author = models.ForeignKey("a, b", null=True)',
+    'author = models.ForeignKey(to=Author)',
+  ]) {
+    assert.equal(rule.check(makeCtx(src)).length, 1, src);
+  }
+});
+
+test('DOL013 flags OneToOneField without on_delete', () => {
+  const rule = ruleByCode('DOL013');
+  const findings = rule.check(makeCtx('profile = models.OneToOneField(User)'));
+  assert.equal(findings.length, 1);
+  assert.deepEqual(findings[0].args, { field: 'OneToOneField' });
+});
+
+test('DOL013 leaves OneToOneField with on_delete alone', () => {
+  const rule = ruleByCode('DOL013');
+  for (const src of [
+    'profile = models.OneToOneField(User, models.CASCADE)',
+    'profile = models.OneToOneField(User, on_delete=models.CASCADE)',
+  ]) {
+    assert.equal(rule.check(makeCtx(src)).length, 0, src);
+  }
+});
+
+test('DOL013 reads past nested calls in the arguments (#182)', () => {
+  const rule = ruleByCode('DOL013');
+  for (const src of [
+    'author = models.ForeignKey(Author, verbose_name=_("author"))',
+    'author = models.ForeignKey(Author, default=get_default_author())',
+    // The comma sits inside a nested call, so it is not a second positional.
+    'author = models.ForeignKey(Author, help_text=_("a, b"))',
+    // A `)` inside a string doesn't close the call early.
+    'author = models.ForeignKey(Author, help_text=_("a) b"))',
+  ]) {
+    assert.equal(rule.check(makeCtx(src)).length, 1, src);
+  }
+  for (const src of [
+    'author = models.ForeignKey(Author, models.CASCADE, verbose_name=_("author"))',
+    'author = models.ForeignKey(Author, on_delete=models.CASCADE, verbose_name=_("author"))',
+  ]) {
+    assert.equal(rule.check(makeCtx(src)).length, 0, src);
+  }
+});
+
+test('DOL013 leaves ManyToManyField alone, it has no on_delete', () => {
+  const rule = ruleByCode('DOL013');
+  const findings = rule.check(makeCtx('tags = models.ManyToManyField(Tag)'));
+  assert.equal(findings.length, 0);
+});
+
+test('DOL013 range ends at the matching paren, so the fixer edits the right spot', () => {
+  const rule = ruleByCode('DOL013');
+  const src = 'author = models.ForeignKey(Author, verbose_name=_("author"))  # note';
+  const [finding] = rule.check(makeCtx(src));
+  assert.equal(
+    src.slice(finding.range.startCol, finding.range.endCol),
+    'models.ForeignKey(Author, verbose_name=_("author"))',
+  );
+});
+
 test('DOL014 flags CharField without max_length', () => {
   const rule = ruleByCode('DOL014');
   const findings = rule.check(makeCtx('nickname = models.CharField()'));
+  assert.equal(findings.length, 1);
+});
+
+test('DOL014 reads past nested calls before max_length', () => {
+  const rule = ruleByCode('DOL014');
+  const findings = rule.check(
+    makeCtx('nickname = models.CharField(verbose_name=_("Nickname"))'),
+  );
   assert.equal(findings.length, 1);
 });
 
@@ -148,6 +243,14 @@ test('DOL015 flags TextField(max_length=X)', () => {
   );
   assert.equal(findings.length, 1);
   assert.equal(findings[0].applicability, 'suggestion');
+});
+
+test('DOL015 reads past nested calls before max_length', () => {
+  const rule = ruleByCode('DOL015');
+  const findings = rule.check(
+    makeCtx('bio = models.TextField(max_length=1000, verbose_name=_("Bio"))'),
+  );
+  assert.equal(findings.length, 1);
 });
 
 test('DOL015 leaves plain TextField alone', () => {

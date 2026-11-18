@@ -1,11 +1,683 @@
 # Changelog
 
-All notable changes to Django ORM Lens will be documented in this file.
+All notable changes to ORM Lens (django-orm-lens until 1.16.0) will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [py-1.18.1] - 2026-11-17
+
+> Fewer false N+1, drift and migration alarms on real projects.
+
+### Fixed
+
+- **migration-risk: treat annotated or partly computed `dependencies` as unknown**
+  ([#280](https://github.com/FROWNINGdev/orm-lens/issues/280)).
+  Annotated assignments (`dependencies: list = get_dependencies()`) and
+  lists containing computed pairs (`[("shop", get_parent())]`) are now marked
+  `dependencies_unknown`, while recognizing `swappable_dependency(...)` as a
+  known dependency element, preventing false conflicting leaf reports.
+
+- **diff: read the `list --format json` dump its help documents.**
+  `list --format json` writes a flat `[{app, model}]` array, but `_index_models`
+  only understood `{"apps": [...]}`. Both sides indexed as empty, so two dumps
+  that differ printed `No schema changes.` and exited 0. The list shape is now
+  read and reports the model additions/removals that format contains. When
+  only one side is a list dump, the diff stops at model level: marking every
+  field of the other side as removed would be false.
+
+- **Docs: `--path` / `--exclude` and the MCP tool list**
+  ([#282](https://github.com/FROWNINGdev/orm-lens/issues/282)).
+  The READMEs said every command takes `--path` and `--exclude`; `stats-sql`
+  and `mcp` take neither, and the READMEs now say so. The Russian, Spanish and
+  Chinese READMEs listed ten MCP tools; they now list all fourteen, as the
+  English one does.
+
+- **parser: recognise aliased Django model roots and key inheritance cycles by (file, class)**
+  ([#281](https://github.com/FROWNINGdev/orm-lens/issues/281)).
+  An imported alias of `django.db.models.Model` (e.g. `from django.db.models import Model as DjangoModel`)
+  is now resolved as a model root before workspace mixin suppression, preventing subclasses of
+  workspace mixins from dropping out of the model list. In addition, abstract base cycle detection
+  is now keyed on `(file, class)` rather than bare class name, so an abstract mixin extending a
+  same-named mixin in another module no longer drops inherited fields.
+
+- **nplusone: `Prefetch(..., queryset=...select_related(...))` covers the inner loop.**
+  `Prefetch("items", queryset=OrderItem.objects.select_related("product"))` loads
+  `items__product` too, but only the `items` lookup was recorded, so a loop over
+  `order.items.all()` reading `item.product` was reported as N+1 although the view
+  runs two queries. The inline queryset's `select_related` / `prefetch_related` paths
+  now count under the lookup. A queryset held in a variable, or a `Prefetch` with
+  `to_attr`, is still not followed.
+
+- **impact: report the column of the reference, not of an earlier prefix.**
+  `scan_file_text` searched for the bare needle to find the column, so a line
+  like `authors = ...; book.author.name` pointed at `authors` (column 0)
+  instead of the `author` reference at column 37. The column now comes from
+  the same word-boundary match that accepted the line.
+
+- **Count the fields Django's auth bases give a custom user model**
+  ([#267](https://github.com/FROWNINGdev/orm-lens/issues/267)).
+  A model built on `AbstractBaseUser`, `PermissionsMixin` or `AbstractUser`
+  now inherits their fields (`password`, `last_login`, `is_superuser`,
+  `groups`, `user_permissions`, and the profile fields of `AbstractUser`) in
+  both parsers, so `drift` no longer reports them as migrated but no longer
+  declared. A workspace class with the same name still wins, a field the
+  model sets to `None` (`username = None`) stays removed, and an abstract
+  parent's own field now overrides the same field from its ancestors.
+
+- **suggest-indexes: propose one index for a column sorted both ways.**
+  `order_by("created_at")` and `order_by("-created_at")` produced two
+  proposals, `[created_at]` and `[-created_at]`. A B-tree index answers the
+  sort in either direction, so the second was redundant write cost. The
+  order_by pass now dedupes on the bare column, including against a
+  filter-driven proposal on the same column.
+
+- **migration-risk: no leaf conflict when `dependencies` is computed**
+  ([#247](https://github.com/FROWNINGdev/orm-lens/issues/247)).
+  A migration with `dependencies = get_dependencies()` was read as having no
+  dependencies, so its parent looked like a second leaf and a linear history
+  got a critical `conflicting_migration_leaves`. Such a migration is now
+  marked `dependencies_unknown` and the leaf check stays silent for its app.
+
+- **VS Code rules DOL011 / DOL014 / DOL015 read past nested calls.**
+  `CharField(max_length=100, verbose_name=_("Name"), null=True)` was never
+  matched: the rules scanned the call with `([^()]*)`, which stops at the
+  paren inside `_("Name")`. i18n-wrapped fields escaped the `null=True`,
+  missing-`max_length` and `TextField(max_length=)` checks. All three now use
+  the same `readCallArgs` helper DOL013 already used.
+
+- **Parser: models in a sub-package keep their app's label**
+  ([#266](https://github.com/FROWNINGdev/orm-lens/issues/266)).
+  `io_storages/s3/models.py` was labelled `s3`; the CLI now walks up through
+  packages to the directory with `migrations/` or `apps.py`, so it is
+  `io_storages.S3ImportStorage`, as Django calls it, and `drift` no longer
+  reports it as undeclared. The VS Code parser still uses the old rule.
+
+- **Parser: ignore Django field examples inside model docstrings.** Both the
+  CLI and VS Code now keep those examples out of the model's field list.
+
+- **suggest-indexes: skip composites over a unique column**
+  ([#269](https://github.com/FROWNINGdev/orm-lens/issues/269)).
+  A combo containing the primary key, a `unique=True` field or a
+  `OneToOneField` is no longer proposed: equality on that column already
+  returns at most one row, so the rest of the index never pays for its
+  writes. `db_index=True` fields stay eligible.
+
+- **migration-risk: no more `app.None` in text output for graph-level findings**
+  ([#268](https://github.com/FROWNINGdev/orm-lens/issues/268)).
+  `conflicting_migration_leaves` / `alembic_multiple_heads` now print
+  `(migration graph) shop` instead of `shop.None`.
+
+- **suggest-indexes: only propose indexes on local columns**
+  ([#252](https://github.com/FROWNINGdev/orm-lens/issues/252)).
+  Many-to-many and reverse relation lookups still appear in usage counts,
+  but no longer produce invalid `Meta.indexes` suggestions. Django field imports
+  that use an alias keep their original field type in both parsers.
+
+- **Recognize directly imported Django field types** ([#250](https://github.com/FROWNINGdev/orm-lens/issues/250)).
+  The CLI and VS Code parsers now recognize `GeneratedField` and PostgreSQL
+  fields such as `ArrayField`, `HStoreField`, range fields, and
+  `SearchVectorField`. Schema drift checks can now match those declarations
+  to their migrations.
+
+- **Workspace Mixin classes are no longer guessed to be models**
+  ([#249](https://github.com/FROWNINGdev/orm-lens/issues/249)). Any base
+  whose name ended in `Mixin` used to count as a Django model base, so plain
+  helpers (QuerySets, URL mixins) were reported as models and `drift` failed
+  with "declared, but no migration creates it". A base is now resolved
+  through its module's imports — including aliases — before the suffix guess
+  is used, and a class dropped as a known non-model (`models.QuerySet`,
+  `models.Manager`, ...) also stops its subclasses from becoming models. A
+  real abstract mixin is still found through its `models.Model` base, and a
+  third-party `*Mixin` the scanner cannot see keeps the guess.
+
+- **Abstract bases with the same class name are matched by `(file, name)`,
+  not bare name** ([#249](https://github.com/FROWNINGdev/orm-lens/issues/249)).
+  When two apps defined a base with the same class name, a model could
+  inherit from whichever same-named base was seen first because the other
+  base was treated as already known. Bases are now identified by the file
+  their import resolves to, so a model inherits the fields of its own app's
+  base instead of another app's.
+
+- **nplusone: no `select_related` for a scalar when the loop's model is
+  unknown** ([#251](https://github.com/FROWNINGdev/orm-lens/issues/251)).
+  `for e in self.events.all(): e.date_from.astimezone(tz)` was guessed to be a
+  foreign key and got `.select_related("date_from")`, which Django rejects. A
+  name that is a scalar on every model that has it is now skipped. A name that
+  is a relation on at least one model, or on none, is still guessed at
+  `medium`.
+
+- **signals: read the `signal=` argument to `@receiver`.** Single signals and
+  lists/tuples passed by keyword now retain their names and built-in markers
+  instead of appearing as `<unknown>` custom edges (#248).
+
+- **signals: resolve aliased `receiver` imports.** Imports such as
+  `from django.dispatch import receiver as on` and `import django.dispatch as d`
+  are now resolved when matching `@receiver` decorators ([#261](https://github.com/FROWNINGdev/orm-lens/issues/261)).
+
+- **Migration files without a four-digit prefix are read**
+  ([#246](https://github.com/FROWNINGdev/orm-lens/issues/246)).
+  Django loads every module in `migrations/` whose name does not start with
+  `_` or `~`, so hand-inserted `0162b_auto_...py` and legacy `008_...py` files
+  are real migrations. orm-lens skipped them, which hid an `AddField` from
+  `drift` and split the graph into false conflicting leaves. They are now
+  loaded and ordered by their numeric prefix.
+
+- **drift: `state_operations` bound inside the `Migration` class is resolved**
+  ([#245](https://github.com/FROWNINGdev/orm-lens/issues/245)).
+  `SeparateDatabaseAndState(state_operations=state_operations)` with the list
+  on the class, as Django's docs write it, was dropped, so its `CreateModel`
+  never counted and `drift` blocked on a migrated model.
+
+## [0.22.1] - 2026-11-17
+
+> Model rules read translated verbose_name; auth fields counted.
+
+### Fixed
+
+- **Count the fields Django's auth bases give a custom user model**
+  ([#267](https://github.com/FROWNINGdev/orm-lens/issues/267)).
+  A model built on `AbstractBaseUser`, `PermissionsMixin` or `AbstractUser`
+  now inherits their fields (`password`, `last_login`, `is_superuser`,
+  `groups`, `user_permissions`, and the profile fields of `AbstractUser`) in
+  both parsers, so `drift` no longer reports them as migrated but no longer
+  declared. A workspace class with the same name still wins, a field the
+  model sets to `None` (`username = None`) stays removed, and an abstract
+  parent's own field now overrides the same field from its ancestors.
+
+- **VS Code rules DOL011 / DOL014 / DOL015 read past nested calls.**
+  `CharField(max_length=100, verbose_name=_("Name"), null=True)` was never
+  matched: the rules scanned the call with `([^()]*)`, which stops at the
+  paren inside `_("Name")`. i18n-wrapped fields escaped the `null=True`,
+  missing-`max_length` and `TextField(max_length=)` checks. All three now use
+  the same `readCallArgs` helper DOL013 already used.
+
+- **Parser: ignore Django field examples inside model docstrings.** Both the
+  CLI and VS Code now keep those examples out of the model's field list.
+
+- **suggest-indexes: only propose indexes on local columns**
+  ([#252](https://github.com/FROWNINGdev/orm-lens/issues/252)).
+  Many-to-many and reverse relation lookups still appear in usage counts,
+  but no longer produce invalid `Meta.indexes` suggestions. Django field imports
+  that use an alias keep their original field type in both parsers.
+
+- **Recognize directly imported Django field types** ([#250](https://github.com/FROWNINGdev/orm-lens/issues/250)).
+  The CLI and VS Code parsers now recognize `GeneratedField` and PostgreSQL
+  fields such as `ArrayField`, `HStoreField`, range fields, and
+  `SearchVectorField`. Schema drift checks can now match those declarations
+  to their migrations.
+
+## [py-1.18.0] - 2026-11-11
+
+> Fewer false drift alarms on django-oscar-style and moved models.
+
+### Fixed
+
+- **A plain class above `if not is_model_registered(...)` no longer hides the
+  models below it** ([#226](https://github.com/FROWNINGdev/orm-lens/issues/226)).
+  The body of a column-0 class only ended at the next column-0 `class`, so in
+  django-oscar's `basket/models.py` the `InvalidBasketLineError` exception
+  swallowed `Basket`, `Line` and `LineAttribute`, and `drift` reported them as
+  undeclared. A column-0 `if` / `elif` / `else` / `for` / `while` / `try` /
+  `except` / `finally` / `with` / `def` / `async` / decorator line now ends a
+  column-0 class too, unless it is inside a multi-line string (a docstring line
+  such as `if needed, ...`). Column-0 comments and other column-0 text still
+  stay in the body.
+- **`orm-lens drift`: models created inside `SeparateDatabaseAndState` count as
+  migrated** ([#220](https://github.com/FROWNINGdev/orm-lens/issues/220)).
+  Replay read only the top-level operations, so a model moved between apps
+  through `state_operations` was reported as "declared but never migrated".
+  `state_operations` (a literal list, a tuple or a module-level name bound to
+  one) is now replayed; `database_operations` still never changes state.
+- **`suggest-indexes` skips test modules by default**
+  ([#224](https://github.com/FROWNINGdev/orm-lens/issues/224)). Filters that
+  only tests run no longer produce index proposals for production models.
+  `--include-tests` brings them back.
+- **Abstract bases with the same class name no longer swap fields**
+  ([#227](https://github.com/FROWNINGdev/orm-lens/issues/227)). When two
+  apps defined an abstract base with the same name (for example
+  `AbstractLine` in django-oscar's `basket` and `order` apps), every subclass
+  inherited the fields of whichever base was scanned first. A subclass now
+  inherits from the base in its own directory, and falls back to the first
+  definition as before.
+- **`orm-lens er`: two models with the same class name stay two entities in
+  Mermaid** ([#223](https://github.com/FROWNINGdev/orm-lens/issues/223)).
+  Mermaid has one namespace for entity names, so `basket.Line` and
+  `order.Line` were drawn as one `Line` box with both apps' columns. A class
+  name defined in more than one app is now written as `<app>_<Model>`
+  (`basket_Line`, `order_Line`), and relation ends resolve to the model in
+  the field's own app, or the app named in the reference (`"order.Line"`).
+  Diagrams without duplicate names are unchanged.
+- **nplusone / suggest-indexes: `models.Nap.objects` is a model.** Projects
+  that import the models module (`from core import models`) and write
+  `models.Nap.objects.filter(...)` now get the model resolved like
+  `Nap.objects.filter(...)`: a scalar field such as `nap.duration.seconds` no
+  longer gets `select_related` advice (a `FieldError` at runtime), a real
+  foreign key is reported at `high` confidence, and `suggest-indexes` counts
+  these filter sites (#222).
+- **suggest-indexes: `<fk>_id` and `<fk>` are the same column.** A
+  `Meta.indexes` entry written with the column name (`fields=["category_id",
+  "slug"]`) now covers `filter(category=..., slug=...)`, so the same index is
+  no longer proposed again, and `filter(category_id=...)` and
+  `filter(category=...)` are counted as one field. Only real ForeignKey /
+  OneToOneField names are folded; a plain `external_id` keeps its name (#225).
+- **signals: `@receiver([post_save, post_delete], ...)` produces one edge per signal.** `signal_graph` read the first decorator argument as a single dotted name, so a list or tuple became one `<unknown>` `[custom]` edge and a list-form `post_delete` receiver vanished from the DB_CASCADE `skipped_receivers` warning. `_signal_arg_names` now returns one name per readable element, and the decorator branch adds one edge per name. `<unknown>` remains for the case where nothing is readable. `signal.connect()` is unchanged.
+- **drift: `objects = models.Manager()` is no longer a model field.** Both parsers treated any `models.<Name>(...)` assignment as a field, so an explicit default manager showed up in `scan`, `describe`, ER diagrams, and, worst of all, blocking drift. `Manager` and `QuerySet` are skipped in both `cli/orm_lens/parser.py` and `src/parser.ts`, with the whole call skipped so multi-line declarations do not leak their arguments. `TaggableManager` stays a relation. The saleor golden snapshot drops the `objects` field that its `Category` model declares.
+
+## [0.22.0] - 2026-11-11
+
+> Generated factories fill choices= fields with real values.
+
+### Added
+
+- **Generate factory_boy factory: `choices=` fields get a real `factory.Iterator`.** `Kind.choices` becomes `Kind.values` (with a `# TODO: import Kind` comment), a named list such as `STATUS_CHOICES` becomes `[value for value, _label in STATUS_CHOICES]` (with a `# TODO: import ...` comment), and an inline list of pairs uses the first element of each pair. Calls and grouped choices still get the `[...]  # TODO` placeholder (#228).
+
+### Fixed
+
+- **drift: `objects = models.Manager()` is no longer a model field.** Both parsers treated any `models.<Name>(...)` assignment as a field, so an explicit default manager showed up in `scan`, `describe`, ER diagrams, and, worst of all, blocking drift. `Manager` and `QuerySet` are skipped in both `cli/orm_lens/parser.py` and `src/parser.ts`, with the whole call skipped so multi-line declarations do not leak their arguments. `TaggableManager` stays a relation. The saleor golden snapshot drops the `objects` field that its `Category` model declares.
+
+## [py-1.17.1] - 2026-11-05
+
+> The orm-lens-* pre-commit hooks exist, and the old name says it is old.
+
+### Fixed
+
+- **pre-commit: `orm-lens-nplusone` and `orm-lens-migration-risk` exist.**
+  The orm-lens README on PyPI has shown these hook ids since 1.16.0, but
+  `.pre-commit-hooks.yaml` only defined the `django-orm-lens-*` ones, so
+  pre-commit stopped with "No hook with id". Both spellings work now; the old
+  ids name the new one in their output. The hooks run the `orm-lens` command
+  and their environment installs `orm-lens` directly.
+
+### Changed
+
+- **The old name says it is old.** In `django-orm-lens` 1.17.1, the compat
+  package, the `django-orm-lens` and `django-orm-lens-mcp` commands and
+  `python -m django_orm_lens` print a one-line note on stderr pointing at
+  `pip install orm-lens`, and `import django_orm_lens` raises a
+  `DeprecationWarning`. stdout is untouched, so JSON reports and the MCP stdio
+  stream are unaffected; `ORM_LENS_NO_RENAME_NOTICE=1` hides the note.
+- **`django-orm-lens` follows orm-lens 1.x.** It depends on
+  `orm-lens>=1.17.1,<2` instead of one exact release, so installing the old
+  name always brings the current orm-lens, and the compat package is no
+  longer released alongside every orm-lens version.
+- Internal: the `parser` / `sqlalchemy_parser` import cycle is gone
+  ([#213](https://github.com/FROWNINGdev/orm-lens/pull/213)).
+
+## [py-1.17.0] - 2026-11-04
+
+> Alembic risks over MCP, and composite foreign keys in ER diagrams.
+
+### Added
+
+- **`migration_risk` is an MCP tool of its own.** Agents working on FastAPI,
+  Flask or other Alembic projects can ask for migration risks without the
+  Django-only `blast_radius`: it returns the findings of Django migrations and
+  Alembic revisions in the `migration-risk --format json` shape, filtered by
+  `severity` (`critical` by default; an unknown value returns
+  `INVALID_SEVERITY`). A `pyproject.toml` with `[tool.alembic]` now counts as a
+  workspace. That makes fourteen MCP tools.
+  ([#197](https://github.com/FROWNINGdev/orm-lens/issues/197)) Contributed by
+  @christoferpedrosanchezzuzunaga-eng.
+
+- **Alembic: `op.drop_table` is flagged like `drop_column`.** The previous
+  release's models keep querying a dropped table until every instance is
+  replaced, so `alembic_drop_table_breaks_running_code` warns on a populated
+  table, and stays quiet in the base revision and after a `create_table` in
+  the same revision. A table name held in a module constant
+  (`TABLE = "orders"; op.drop_table(TABLE)`) is now resolved for every rule.
+  ([#196](https://github.com/FROWNINGdev/orm-lens/issues/196)) Contributed by
+  @bfs2021.
+
+### Fixed
+
+- **SQLAlchemy: composite foreign keys are drawn.** A `ForeignKeyConstraint`
+  over several columns in `__table_args__` now becomes one relation in the ER
+  diagram, carried by its first local column, with `ondelete=` as its delete
+  policy. Explicit column names and `key=` are resolved; constraints with
+  dynamic names, missing columns or targets in several tables are skipped
+  rather than guessed. In DBML a foreign-key column of a SQLAlchemy model keeps
+  its real type (`user_id Integer`) and its `[pk]` marker instead of
+  `user_id ForeignKey`.
+  ([#208](https://github.com/FROWNINGdev/orm-lens/issues/208)) Contributed by
+  @snehaapratap.
+- **Alembic messages no longer say `'None'`.** When a table or column is only
+  named at runtime (`for t in [...]: op.drop_column(t, "legacy_id")`), every
+  rule says so: `Drops 'legacy_id' of a table named at runtime` instead of
+  `Drops 'None.legacy_id'`.
+  ([#207](https://github.com/FROWNINGdev/orm-lens/issues/207)) Contributed by
+  @SatriaBagusNurhadianto.
+
+## [0.21.0] - 2026-11-04
+
+> Rate ORM Lens from the editor you use it in, after it has done some work for you.
+
+### Changed
+
+- **The thank-you prompt offers a store rating, and waits for real use.** It
+  used to count only ER-diagram opens and link only to GitHub. It now counts
+  every command that hands you a result - the diagram, a schema diff, an
+  impact-analysis jump, a generated factory or query, the reverse-references
+  list - but never a cancelled pick or an error, and asks on the fifth
+  instead of the third. "Rate it" opens the Visual Studio Marketplace in VS
+  Code and Open VSX in Cursor, Windsurf, VSCodium and other builds, since a
+  rating only helps on the store your editor installs from. Still at most
+  two asks, ever; anyone who already answered is not asked again.
+- **Listing name: "ORM Lens for Django — ER Diagram, N+1 & Autocomplete".**
+  The extension ID `frowningdev.django-orm-lens` is unchanged.
+- **The README download badge counts both package names.** It showed
+  `django-orm-lens` alone, so installs under the new name went uncounted; it now adds
+  `orm-lens` without counting a shim install twice
+  (`scripts/download_badge.py`, refreshed weekly).
+- **Release pages are titled for users.** A CHANGELOG section can open with a
+  `> headline` line, which becomes the GitHub release title for both
+  extension and Python tags; extension releases also carry their CHANGELOG
+  section instead of a list of merged PRs.
+
+### Fixed
+
+- **The extension package no longer carries the Python CLI.** Every VSIX
+  shipped the whole `cli/` directory, test suite and vendored fixture
+  projects included, though the extension never runs it. The package drops
+  from 1.8 MB to 1.3 MB and from hundreds of files to 40. The packaging
+  tool's `minimatch` is pinned to 11.0.1+ for a denial-of-service advisory
+  (development dependency only; nothing of it reaches the extension).
+
+## [0.20.0] - 2026-10-31
+
+### Changed
+
+- **The extension is now "ORM Lens for Django".** The project was renamed
+  from django-orm-lens to orm-lens when it started covering SQLAlchemy. Command
+  titles, the sidebar, the output channel and the diagnostics' source read
+  "ORM Lens". The extension ID stays `frowningdev.django-orm-lens`, so updates
+  arrive as usual and settings (`djangoOrmLens.*`) are untouched. Inline
+  suppressions accept `# orm-lens-disable…` and, as before,
+  `# django-orm-lens-disable…`. A Problems-panel filter on the old source
+  name "Django ORM Lens" needs the new one.
+
+## [py-1.16.0] - 2026-10-31
+
+### Changed
+
+- **django-orm-lens is now orm-lens, and reads SQLAlchemy models.**
+  The package is `orm-lens` on PyPI, with the commands `orm-lens` and
+  `orm-lens-mcp` and the module `orm_lens`. Nothing written against the old
+  name breaks: `pip install django-orm-lens` (and `[mcp]`) installs the
+  matching orm-lens and keeps the `django-orm-lens` / `django-orm-lens-mcp`
+  commands and `import django_orm_lens`, and upgrading an existing install
+  keeps both command names. The MCP server reads `ORM_LENS_ROOT` and
+  `ORM_LENS_ALLOWED_ROOTS`, then the old `DJANGO_ORM_LENS_*` names. The
+  repository moved to `github.com/FROWNINGdev/orm-lens` (the old URLs
+  redirect), the docs to `frowningdev.github.io/orm-lens`, the MCP Registry
+  entry to `io.github.FROWNINGdev/orm-lens`, and the image to
+  `ghcr.io/frowningdev/orm-lens` (`ghcr.io/frowningdev/django-orm-lens` keeps
+  getting the same builds). Kept on purpose: the pre-commit hook ids, the
+  SARIF tool name (code scanning keys open alerts on it) and the blast-radius
+  PR-comment marker. The GitHub Action still accepts a pre-1.16 `version`.
+
+### Added
+
+- **SQLAlchemy models: scan, ER diagrams and N+1 (preview).**
+  `scan`, `list`, `describe`, `hover`, `er` and `nplusone`, and the matching
+  MCP tools, now read SQLAlchemy models: 2.0 `DeclarativeBase` / `Mapped[]`,
+  1.x `declarative_base()` / `Column`, Flask-SQLAlchemy `db.Model` and
+  SQLModel `table=True` classes. Static as always: `ast`, no import, no
+  database. Bases and mixins are followed across files, table names come
+  from `__tablename__` or the base's naming rule, foreign keys become ER
+  edges, and `relationship()` attributes are listed with their loader.
+  `nplusone` flags a loop over query results that reads a lazy relationship
+  without `selectinload` / `joinedload` in the query's options, and suggests
+  the option. The Django analyses (drift, blast radius, cascade, signals)
+  stay Django-only. Checked on Superset, Airflow, Prefect, Polar, Dispatch,
+  Mealie, CTFd, Redash and the FastAPI template: 12 N+1 findings, all real.
+  See [docs/rules/sqlalchemy.md](docs/rules/sqlalchemy.md).
+
+### Fixed
+
+- **SQLAlchemy and Flask classes no longer pass for Django models.** A
+  `models.py` with `class User(db.Model)` or Flask-AppBuilder's `Model`
+  matched the parser's `Model` heuristic, so a Flask project showed up as a
+  Django one: 65 phantom models in Superset, 138 in Polar, 69 in Dispatch.
+  Files that are SQLAlchemy code and never import Django are now left to
+  the SQLAlchemy reader. The Django projects in the census are unchanged.
+
+## [0.19.6] - 2026-10-31
+
+### Fixed
+
+- **DOL013 missed `OneToOneField` without `on_delete` (#181).**
+  `models.OneToOneField(User)` raises `TypeError` at import just like a
+  `ForeignKey` without a policy, but the rule only checked `ForeignKey`. It now
+  flags both, its message names the field it found, and the quick fix adds
+  `on_delete=models.CASCADE` to either. `ManyToManyField` has no `on_delete` and
+  is still left alone. Contributed by @1AbdullahButt.
+
+- **DOL013 missed a `ForeignKey` with a call in its arguments.** The rule's
+  regex stopped at the first inner `(`, so
+  `ForeignKey(Author, verbose_name=_("author"))` or
+  `ForeignKey(Author, default=get_default_author())` was never checked, which
+  took the rule away from most relations in translated projects. The argument
+  list is now read with balanced brackets and quotes. A comma inside a nested
+  call is not a second positional argument, and the QuickFix inserts
+  `on_delete=` before the call's own closing `)`. The rule still checks one
+  line at a time. ([#182](https://github.com/FROWNINGdev/django-orm-lens/issues/182)) Contributed by @1AbdullahButt.
+
+## [py-1.15.0] - 2026-10-31
+
+### Added
+
+- **`migration-risk` reads Alembic revisions (preview).** SQLAlchemy projects
+  without Django (FastAPI, Flask) get the same static migration review: any
+  `versions/` revision is parsed with `ast` and never run. Eleven rules cover
+  a NOT NULL `add_column` without `server_default` (SQLAlchemy's `default=` only
+  applies on INSERT), `create_index` without `CONCURRENTLY`, `alter_column` to NOT
+  NULL or to a new type, renamed and dropped columns and tables, unique,
+  foreign-key and check constraints, and multiple heads. `batch_alter_table`
+  blocks and Flask-Migrate layouts are covered. The populated-table rules
+  learned from the Django census apply too: a same-revision `create_table` or
+  the base revision means an empty table, and a data operation first makes the
+  finding a warning. Over ~1170 revisions from Superset, Airflow, Prefect,
+  Polar, Dispatch, Mealie and the FastAPI template there are 9 critical
+  findings, each a NOT NULL column that fails on a populated table. Rules:
+  `docs/rules/alembic.md`.
+
+### Fixed
+
+- **`signals` / MCP `signal_graph` missed receivers registered with
+  `.connect()`.** Only `@receiver(...)` decorators were read, so
+  `post_delete.connect(delete_file, sender=Attachment)` in an `AppConfig.ready()`
+  was invisible, and `cascade` left it out of the `DB_CASCADE`
+  `skipped_receivers` list. `signal.connect(handler, sender=Model)` is now an
+  edge like a decorator, with a bare or dotted signal (`post_delete`,
+  `models.signals.post_delete`), `receiver=` as a keyword, and no `sender`
+  meaning every model. To keep sockets and database clients out, a `.connect()`
+  call only counts when the signal is a Django built-in, a `Signal()` defined in
+  the workspace, or the call passes `sender=`.
+  ([#183](https://github.com/FROWNINGdev/django-orm-lens/issues/183)) Contributed by @1AbdullahButt.
+
+- **`nplusone` read assignments and instance methods as relation reads.**
+  Two more patterns from the real-world census:
+  - `device.cluster = cluster` inside a loop (NetBox) assigns the attribute
+    and loads nothing. `device.cluster.name = x` still loads
+    `device.cluster`, so that one is still reported.
+  - `check.matches_tag_set(tags)` (Healthchecks) is a method on the loop
+    variable, but its name matched the `<model>_set` reverse-manager
+    heuristic. A call made directly on the loop variable is never a
+    relation read; managers are always one attribute deeper.
+
+## [py-1.14.0] - 2026-10-31
+
+### Fixed
+
+- **`migration-risk`: 407 criticals on six big Django codebases, 2 real.**
+  Run over NetBox, PostHog, authentik, Plane, paperless-ngx and Healthchecks,
+  it reported 407 critical findings, and 2 of them were real. The rules now
+  follow what Django actually does to existing rows:
+  - `ManyToManyField`, `TaggableManager` and `GenericRelation` add no column,
+    so they are never a NOT NULL risk.
+  - `blank=True` on a text field, including project subclasses such as
+    `ColorField(max_length=6)`, gets `""`. `auto_now` / `auto_now_add` get the
+    current time, and `db_default` and `GeneratedField` fill themselves.
+  - A table created earlier in the same migration is empty. A squashed
+    migration (`replaces = [...]`) only ever runs on a fresh database.
+  - `unique=True` with `null=True` and no default, or `default=None`, fills
+    rows with NULL, which never collides.
+  - A field removed and then re-added, renamed onto the same name, or a model
+    deleted and re-created, in that migration or a later one, is no longer
+    "still referenced".
+  - The migration graph collapses squashed migrations the way Django's loader
+    does, so a squash and the migrations it replaces are not reported as
+    conflicting leaves.
+  - A NOT NULL column added after a `RunPython`, or after a `RunSQL` that
+    deletes, updates or truncates rows, is a warning instead of a certain
+    critical, because that step may have emptied the table.
+
+- **`nplusone` reported writes and test code as N+1 reads.** Checked against
+  NetBox, PostHog, authentik, Plane, paperless-ngx and Healthchecks:
+  - `post.tags.set(...)`, `.add()`, `.remove()`, `.clear()`, `.create()` and
+    `.get_or_create()` on a relation were caught by the attribute-chain
+    fallback and given a prefetch, which cannot serve a write. They are not
+    reported now. Loading a single-valued relation before writing to it
+    (`profile.user.delete()`) is still an N+1, and its fix is
+    `select_related`. QuerySet writes such as `update()` and `delete()` on a
+    related manager stay findings, as before.
+  - One field is never suggested in both `select_related` and
+    `prefetch_related`. `.select_related("user").prefetch_related("user")`
+    came from a schema-less guess on `x.user.delete()`.
+  - Test modules (`test_*.py`, `*_test.py`, `tests.py`, `conftest.py`, and
+    anything under `tests/` or `test/`) are skipped, because a query per row
+    in a test is not a production N+1. Pass `--include-tests` to scan them.
+    This also halves the scan time on large repositories (PostHog: 80 s to
+    39 s).
+
+## [py-1.13.8] - 2026-10-31
+
+### Added
+
+- **`cascade` names the delete handlers Django 6.1's `DB_CASCADE` skips (#179).**
+  With `on_delete=models.DB_CASCADE` the database deletes the child
+  rows itself, so Django never sends `pre_delete` / `post_delete` for them: a
+  `post_delete` handler that removes the uploaded file, writes the audit log
+  or busts a cache just stops running, with no error. `cascade` (CLI and the
+  MCP `cascade_preview` tool) now lists each `@receiver` for that model, or
+  for every model, under the affected relation as `skipped_receivers`, and
+  the text output prints them with file and line. The signal graph is only
+  built when a `DB_CASCADE` relation exists.
+
+- **Tested on Python 3.15 (#180).** CI gained a Python 3.15 + Django 6.1 leg,
+  and the package metadata lists 3.15.
+
+## [0.19.5] - 2026-10-31
+
+### Fixed
+
+- **DOL013 flagged a positional `on_delete` as missing (#176).**
+  `ForeignKey(Order, models.CASCADE)` is valid Django — `contrib.auth` and
+  `contrib.admin` write it that way — but the rule reported an error-severity
+  "ForeignKey requires on_delete", and its quick fix appended a second
+  `on_delete=` that made the call raise for real. A second positional argument
+  now counts as the policy; `ForeignKey(Author, related_name="books")` is still
+  flagged.
+
+- **The ER graph and the reverse-references panel misread `on_delete`
+  (#175, #176).** A positional policy was not read at all, so its edge got the
+  cascade colour by default and the panel showed `unknown`. Django 6.1's
+  `DB_SET_NULL` and `DB_SET_DEFAULT` edges were drawn in the cascade colour too.
+  Both now get the colour of the policy they declare.
+
+## [py-1.13.7] - 2026-10-31
+
+### Fixed
+
+- **`cascade` and `blast-radius` missed a positional `on_delete` (#176).**
+  `ForeignKey` and `OneToOneField` take `(to, on_delete, ...)`, and Django's
+  own `contrib.auth` and `contrib.admin` pass the policy positionally:
+  `ForeignKey(ContentType, models.CASCADE)`. The parser only looked for
+  `on_delete=`, so such relations were left out of every bucket and `cascade`
+  could call the delete isolated. The second positional argument now counts
+  for FK and O2O, with any dotted prefix and `SET(...)`; `ManyToManyField`,
+  whose second positional is `related_name`, is left alone.
+
+- **`cascade` ignored `on_delete=DO_NOTHING` (#177).** Those relations fell out
+  of every bucket, so `cascade` could call a delete isolated that the FK
+  constraint rejects: Django leaves the referencing rows, and the database
+  raises `IntegrityError`. They now land in a new `unhandled` bucket (CLI JSON
+  and the MCP `cascade_preview` tool, additive), the text output lists them as
+  "left as-is by DO_NOTHING" with one line on what happens, and `blast-radius`
+  adds "N left by DO_NOTHING" to its cascade line when there are any. With
+  `db_constraint=False` there is no constraint to trip, so the entry carries
+  `"db_constraint": false` and the text says the rows keep an id that points
+  nowhere.
+
+- **`cascade` called a delete isolated when Django 6.1 would cascade in the
+  database (#175).** Django 6.1 added `on_delete=models.DB_CASCADE`,
+  `DB_SET_NULL` and `DB_SET_DEFAULT`, where the FK constraint carries
+  `ON DELETE` and the database does the work. Those relations fell out of
+  every bucket. They now land in `cascade_kills` / `set_null` marked
+  `"db_level": true`, the text output tags them `(db)` and notes that Django
+  sends no delete signals for them, and DBML export maps them to
+  `delete: cascade` / `set null` / `set default`.
+
+- **`pip install "django-orm-lens[mcp]"` failed outright on Python 3.9
+  (#174).** It never worked there: every mcp release, 1.x included, requires
+  Python 3.10, so pip and uv rejected the whole install, CLI and all.
+  py-1.13.0 made that explicit without noticing, by gating `mcp>=1.0,<2` to
+  `python_version < '3.10'` on the belief that 1.x runs on 3.9. The extra now
+  asks for mcp only on 3.10+, so on 3.9 it installs the CLI and nothing else,
+  and `django-orm-lens-mcp` says the server needs 3.10+ and prints a
+  `uvx --python 3.12` command instead of repeating the pip command that just
+  ran. 3.10+ installs are unchanged (mcp 2.x), and the bootstrap still accepts
+  an mcp 1.x that another tool already put in the environment.
+
+### Changed
+
+- **Tested on every supported Python, 3.9 through 3.14, and on Django 4.2,
+  5.2, 6.0 and 6.1 (#173).** CI ran 3.10–3.12 only, which is how the 3.9
+  install failure above went unnoticed, and stopped at Django 5.2. The package
+  metadata now lists Django 6.0 and 6.1 and Python 3.14, and the 3.9 leg
+  checks that the `[mcp]` extra installs.
+
+## [py-1.13.6] - 2026-10-28
+
+### Fixed
+
+- **`nplusone` skipped loops over sliced QuerySets (#145).** Iterating
+  `Post.objects.filter(...)[:50]` is still lazy and can cause one related
+  lookup per row; it now produces the same finding and eager-loading
+  suggestion as an unsliced QuerySet. A slice of a slice
+  (`qs[:50][:10]`) is unwrapped too.
+
+- **`nplusone` flagged nested relations already prefetched by the outer
+  queryset (#146).** Nested loops now inherit explicit eager-loading paths
+  from their enclosing queryset. Suggestions retain the full schema-validated
+  relation path, such as `product__category`, and partial prefetches still
+  report the relations that remain unloaded. Prefetch-cache coverage now follows
+  supported documented queryset operations on related managers, classifying
+  ordering- and emptiness-dependent cases conservatively while retaining findings
+  for non-cache-served operations and using schema-backed receiver checks to
+  preserve loaded relation prefixes for calls on other receivers.
+
+## [py-1.13.5] - 2026-10-19
+
+### Fixed
+
+- **`blast-radius` had no target for a `RemoveField` once the field was gone
+  from `models.py` (#140).** That is the normal state after `makemigrations`,
+  and exactly when code still reading the column breaks, but `migration-risk`
+  emitted nothing for it, so `blast-radius` never scanned. It now emits an
+  `info` risk, `remove_field`, which `blast-radius --severity info` (or `all`)
+  turns into a target listing the remaining references. `migration-risk
+  --severity info` shows one more line per dropped column. The MCP
+  `blast_radius` tool also rejects an unknown `severity` with an
+  `INVALID_SEVERITY` error instead of silently treating it as `critical`.
+
+- **DBML ER export noted model line numbers 0-based (#139).** The
+  `Note: 'line N of app/models.py'` in `er --format dbml` pointed one line
+  above the class, while every other formatter prints 1-based lines. The
+  note now uses the same 1-based number.
 
 ## [py-1.13.4] - 2026-10-18
 

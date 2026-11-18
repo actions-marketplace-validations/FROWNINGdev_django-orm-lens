@@ -1,6 +1,6 @@
 # Migration risk rules
 
-`django-orm-lens migration-risk --path .` statically analyzes every `<app>/migrations/*.py` in the workspace via `ast.parse` — no Django boot, no database connection, no execution of the migration. It implements **16 rules** over the `operations = [...]` list of each `Migration` class. Every finding carries a severity (`critical` | `warning` | `info`) and a confidence (`high` | `medium` | `low`), plus the description and mitigation shown below.
+`orm-lens migration-risk --path .` statically analyzes every `<app>/migrations/*.py` in the workspace via `ast.parse` — no Django boot, no database connection, no execution of the migration. It implements **16 rules** over the `operations = [...]` list of each `Migration` class. Every finding carries a severity (`critical` | `warning` | `info`) and a confidence (`high` | `medium` | `low`), plus the description and mitigation shown below.
 
 Usage and CI semantics:
 
@@ -9,6 +9,8 @@ Usage and CI semantics:
 - **`--format text|json|sarif|github`** — `sarif` emits SARIF 2.1.0 for upload to GitHub Code Scanning; `github` emits `::error`/`::warning` workflow commands for zero-setup PR annotations. `json` is the machine-readable finding list; `text` is the human default.
 
 Populated-table heuristic: any migration after the app's first (`0001_*`) is assumed to run against a table that already contains rows. Rules marked *populated tables only* stay silent in an app's initial migration. Rules that cross-reference the current `models.py` degrade to a low-confidence `*_unverified` variant when the workspace schema cannot be parsed.
+
+How the rules hold up on real projects: [407 alarms on six big Django codebases, and why 405 of them were wrong](../articles/407-migration-alarms.md).
 
 ## add_field_not_null_no_default
 
@@ -41,6 +43,14 @@ Removes a field while a field with the same name still exists in the current `mo
 Removes a field, but the analyzer could not cross-reference the current `models.py` (schema parse unavailable). Flagged so reviewers see dropped columns at a glance.
 
 **Mitigation:** Manually confirm no code paths still access the removed field.
+
+## remove_field
+
+**Operation:** `RemoveField` · **Severity:** info · **Confidence:** high
+
+Removes a field that is already gone from the current `models.py`, the normal state after `makemigrations`. The model code is consistent, but queries, serializers or templates can still name the column. `blast-radius --severity info` scans for them.
+
+**Mitigation:** Confirm no queries, serializers or templates still reference the removed field.
 
 ## delete_model_still_referenced
 
